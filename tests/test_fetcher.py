@@ -1,11 +1,14 @@
 import asyncio
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from cbg_fetcher import (
+    LOGIN_AGREEMENT_CHECKBOX_SELECTOR,
+    LOGIN_AGREEMENT_CONTROL_SELECTOR,
+    LOGIN_AGREEMENT_ERROR_SELECTOR,
     CBGFetcher,
     _payload_indicates_end,
     _run_async,
@@ -20,6 +23,75 @@ from cbg_fetcher import (
 )
 
 TARGET_URL = "https://yys.cbg.163.com/cgi/mweb/pl?view_loc=equip_list&tfid=f_kingkong"
+
+
+class FakeLocatorCollection:
+    def __init__(self, items=()):
+        self.items = list(items)
+
+    async def count(self):
+        return len(self.items)
+
+    def nth(self, index):
+        return self.items[index]
+
+
+class FakeAgreementElement:
+    def __init__(
+        self,
+        *,
+        visible=True,
+        native=False,
+        checked=False,
+        class_name="",
+        message="",
+    ):
+        self.visible = visible
+        self.native = native
+        self.checked = checked
+        self.class_name = class_name
+        self.message = message
+        self.click_count = 0
+        self.check_count = 0
+
+    async def get_attribute(self, name):
+        if name == "type":
+            return "checkbox" if self.native else None
+        if name == "class":
+            return self.class_name
+        if name == "aria-checked":
+            return "true" if self.checked and not self.native else "false"
+        return None
+
+    async def is_checked(self, timeout=None):
+        return self.checked
+
+    async def check(self, force=False, timeout=None):
+        self.check_count += 1
+        self.checked = True
+
+    async def is_visible(self, timeout=None):
+        return self.visible
+
+    async def click(self, force=False, timeout=None):
+        self.click_count += 1
+        self.checked = True
+        self.class_name += " checked"
+
+    async def inner_text(self, timeout=None):
+        return self.message
+
+
+class FakeAgreementFrame:
+    def __init__(self, *, checkboxes=(), controls=(), errors=()):
+        self.collections = {
+            LOGIN_AGREEMENT_CHECKBOX_SELECTOR: FakeLocatorCollection(checkboxes),
+            LOGIN_AGREEMENT_CONTROL_SELECTOR: FakeLocatorCollection(controls),
+            LOGIN_AGREEMENT_ERROR_SELECTOR: FakeLocatorCollection(errors),
+        }
+
+    def locator(self, selector):
+        return self.collections.get(selector, FakeLocatorCollection())
 
 
 def test_relative_profile_path_is_not_based_on_process_cwd(tmp_path, monkeypatch):
@@ -145,6 +217,83 @@ def test_sync_wrapper_rejects_nested_event_loop_cleanly():
             _run_async(sample())
 
     asyncio.run(run())
+
+
+def test_login_agreement_checks_all_matching_native_inputs():
+    first = FakeAgreementElement(native=True)
+    second = FakeAgreementElement(native=True)
+    frame = FakeAgreementFrame(checkboxes=[first, second])
+
+    assert asyncio.run(CBGFetcher()._ensure_login_agreement(frame)) is True
+    assert first.checked is True
+    assert second.checked is True
+    assert first.check_count == second.check_count == 1
+
+
+def test_login_agreement_skips_hidden_first_control_and_clicks_visible_one():
+    hidden = FakeAgreementElement(visible=False)
+    visible = FakeAgreementElement(visible=True)
+    frame = FakeAgreementFrame(controls=[hidden, visible])
+
+    assert asyncio.run(CBGFetcher()._ensure_login_agreement(frame)) is True
+    assert hidden.click_count == 0
+    assert visible.click_count == 1
+
+
+def test_login_agreement_error_only_uses_visible_error_message():
+    hidden = FakeAgreementElement(visible=False, message="请先勾选登录协议")
+    visible = FakeAgreementElement(visible=True, message="请先阅读并同意服务条款")
+    frame = FakeAgreementFrame(errors=[hidden, visible])
+    assert asyncio.run(CBGFetcher._login_agreement_error_visible(frame)) is True
+
+
+def _mock_first_locator(*, visible=True):
+    locator = MagicMock()
+    locator.first = locator
+    locator.is_visible = AsyncMock(return_value=visible)
+    locator.click = AsyncMock()
+    locator.fill = AsyncMock()
+    return locator
+
+
+def test_login_rechecks_agreement_prompt_and_submits_again():
+    account_tab = _mock_first_locator(visible=False)
+    username_input = _mock_first_locator()
+    password_input = _mock_first_locator()
+    login_button = _mock_first_locator()
+    login_frame = MagicMock()
+    login_frame.url = "https://reg.163.com/login"
+
+    def locate(selector):
+        if selector == "div.u-head1":
+            return account_tab
+        if selector.startswith('input[name="email"]'):
+            return username_input
+        if selector.startswith('input[name="password"]'):
+            return password_input
+        if selector.startswith("a.u-loginbtn"):
+            return login_button
+        raise AssertionError(f"unexpected selector: {selector}")
+
+    login_frame.locator.side_effect = locate
+    page = MagicMock()
+    page.frames = [login_frame]
+    page.goto = AsyncMock()
+    page.wait_for_timeout = AsyncMock()
+    page.wait_for_url = AsyncMock()
+    context = MagicMock()
+    context.cookies = AsyncMock(return_value=[])
+    fetcher = CBGFetcher()
+    fetcher._ensure_login_agreement = AsyncMock(return_value=True)
+    fetcher._login_agreement_error_visible = AsyncMock(side_effect=[True, False])
+
+    result = asyncio.run(
+        fetcher._do_login_in_page(page, context, "temporary-user", "temporary-password")
+    )
+
+    assert result is True
+    assert login_button.click.await_count == 2
+    assert fetcher._ensure_login_agreement.await_args_list[1].kwargs == {"force": True}
 
 
 class FakeResponse:

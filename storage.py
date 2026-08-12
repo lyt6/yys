@@ -29,7 +29,6 @@ TRACKING_QUERY_KEYS = {"refer_sn", "_", "timestamp", "request_id", "trace_id"}
 TERMINAL_AUTH_STATES = {
     "access_denied",
     "business_error",
-    "login_required",
     "mobile_verification_required",
     "rate_limited",
 }

@@ -55,6 +55,45 @@ EQUIPMENT_CONTAINER_KEYS = {
     "selling_list",
 }
 WRAPPER_KEYS = {"data", "result"}
+LOGIN_AGREEMENT_CHECKBOX_SELECTOR = ", ".join(
+    (
+        '.m-mail-clause input[type="checkbox"]',
+        '.fur-agree input[type="checkbox"]',
+        '.j-mail-clause-span input[type="checkbox"]',
+        'input[type="checkbox"][name*="agree" i]',
+        'input[type="checkbox"][id*="agree" i]',
+        'input[type="checkbox"][class*="agree" i]',
+        '[role="checkbox"][aria-label*="协议"]',
+        '[role="checkbox"][aria-label*="条款"]',
+        '[role="checkbox"][aria-label*="隐私"]',
+    )
+)
+LOGIN_AGREEMENT_CONTROL_SELECTOR = ", ".join(
+    (
+        "span.u-dl-agree",
+        "span.j-mail-clause-span",
+        "div.m-mail-clause > span:first-child",
+        "div.fur-agree > span:first-child",
+        "div.m-mail-clause",
+        "div.fur-agree",
+    )
+)
+LOGIN_AGREEMENT_ERROR_SELECTOR = ", ".join(
+    (
+        ".j-err",
+        ".u-err",
+        ".ferrorhead",
+        ".error-msg",
+        '[role="alert"]',
+    )
+)
+LOGIN_AGREEMENT_ERROR_MARKERS = (
+    "请先阅读并同意",
+    "请阅读并同意",
+    "请先勾选",
+    "请勾选",
+    "请先同意",
+)
 
 
 def parse_cbg_url(url: str) -> dict[str, str]:
@@ -407,6 +446,104 @@ class CBGFetcher:
             finally:
                 await self._close_context(context)
 
+    @staticmethod
+    async def _agreement_control_reports_checked(control) -> bool:
+        try:
+            if await control.get_attribute("aria-checked") == "true":
+                return True
+            if await control.get_attribute("data-checked") == "true":
+                return True
+            class_name = str(await control.get_attribute("class") or "").lower()
+            return any(
+                marker in class_name
+                for marker in ("checked", "selected", "is-active", "is-on", "agree-ok")
+            )
+        except Exception:
+            return False
+
+    async def _ensure_login_agreement(self, login_frame, *, force: bool = False) -> bool:
+        """Select the visible login agreement and verify native state when exposed."""
+        found = False
+        checkbox_count = 0
+        checked_count = 0
+        try:
+            checkboxes = login_frame.locator(LOGIN_AGREEMENT_CHECKBOX_SELECTOR)
+            checkbox_count = await checkboxes.count()
+        except Exception:
+            checkboxes = None
+
+        for index in range(checkbox_count):
+            checkbox = checkboxes.nth(index)
+            found = True
+            try:
+                is_native = await checkbox.get_attribute("type") == "checkbox"
+                if is_native:
+                    if not await checkbox.is_checked(timeout=500):
+                        await checkbox.check(force=True, timeout=2000)
+                    if await checkbox.is_checked(timeout=500):
+                        checked_count += 1
+                else:
+                    if await checkbox.get_attribute("aria-checked") != "true":
+                        await checkbox.click(force=force, timeout=2000)
+                    if await checkbox.get_attribute("aria-checked") == "true":
+                        checked_count += 1
+            except Exception:
+                continue
+
+        if checkbox_count and checked_count == checkbox_count:
+            print(">> [登录] 已勾选并校验登录协议。", flush=True)
+            return True
+
+        try:
+            controls = login_frame.locator(LOGIN_AGREEMENT_CONTROL_SELECTOR)
+            control_count = await controls.count()
+        except Exception:
+            controls = None
+            control_count = 0
+
+        for index in range(control_count):
+            control = controls.nth(index)
+            try:
+                if not await control.is_visible(timeout=500):
+                    continue
+                found = True
+                if await self._agreement_control_reports_checked(control):
+                    print(">> [登录] 登录协议已处于勾选状态。", flush=True)
+                    return True
+                await control.click(force=force, timeout=2000)
+                if await self._agreement_control_reports_checked(control):
+                    print(">> [登录] 已勾选并校验登录协议。", flush=True)
+                else:
+                    print(">> [登录] 已点击登录协议控件，将在提交时再次校验。", flush=True)
+                return True
+            except Exception:
+                continue
+
+        if not found:
+            print(">> [登录] 当前登录表单未显示协议勾选控件。", flush=True)
+            return True
+        print(">> [登录] 协议控件存在，但无法完成勾选。", flush=True)
+        return False
+
+    @staticmethod
+    async def _login_agreement_error_visible(login_frame) -> bool:
+        try:
+            errors = login_frame.locator(LOGIN_AGREEMENT_ERROR_SELECTOR)
+            count = await errors.count()
+        except Exception:
+            return False
+        for index in range(count):
+            error = errors.nth(index)
+            try:
+                if not await error.is_visible(timeout=300):
+                    continue
+                message = str(await error.inner_text(timeout=500) or "")
+                if any(marker in message for marker in LOGIN_AGREEMENT_ERROR_MARKERS):
+                    return True
+            except Exception:
+                continue
+        return False
+
     async def _do_login_in_page(
         self,
         page,
@@ -443,22 +580,25 @@ class CBGFetcher:
         print(">> [登录] 正在填写登录凭据...", flush=True)
         await username_input.fill(username)
         await password_input.fill(password)
-        try:
-            agreement = login_frame.locator(
-                "span.u-dl-agree, span.j-mail-clause-span, "
-                "div.m-mail-clause span, div.m-mail-clause, div.fur-agree"
-            ).first
-            if await agreement.is_visible(timeout=1500):
-                await agreement.click()
-        except Exception:
-            pass
+        if not await self._ensure_login_agreement(login_frame):
+            return False
 
         login_button = login_frame.locator("a.u-loginbtn, div.loginbox a").first
         if not await login_button.is_visible(timeout=5000):
             print(">> [登录] 未找到登录按钮。", flush=True)
             return False
-        print(">> [登录] 正在提交登录...", flush=True)
-        await login_button.click()
+        for submit_attempt in range(2):
+            print(">> [登录] 正在提交登录...", flush=True)
+            await login_button.click()
+            await page.wait_for_timeout(600)
+            if not await self._login_agreement_error_visible(login_frame):
+                break
+            if submit_attempt == 1:
+                print(">> [登录] 登录页仍提示必须同意协议，已停止本次提交。", flush=True)
+                return False
+            print(">> [登录] 登录页提示协议未勾选，正在强制重试一次。", flush=True)
+            if not await self._ensure_login_agreement(login_frame, force=True):
+                return False
         try:
             await page.wait_for_url(lambda current: not self._is_login_page(current), timeout=10000)
         except Exception:

@@ -177,6 +177,30 @@ def test_restart_delay_uses_poll_interval_and_longer_terminal_cooldown(tmp_path)
     assert decision["delay_seconds"] == pytest.approx(50)
 
 
+def test_login_required_restart_uses_normal_poll_interval(tmp_path):
+    store = SQLiteStore(str(tmp_path / "cbg.sqlite3"))
+    target = target_key_for_url(URL)
+    now = datetime(2026, 8, 12, 8, 0, tzinfo=timezone.utc)
+    failed = make_result([], cycle=1, success=False)
+    failed.update(
+        {
+            "auth_state": "login_required",
+            "started_at": (now - timedelta(seconds=11)).isoformat(),
+            "fetched_at": (now - timedelta(seconds=10)).isoformat(),
+        }
+    )
+    store.record_result("one", target, URL, failed)
+    decision = store.get_restart_delay(
+        "one",
+        target,
+        poll_interval_seconds=60,
+        terminal_cooldown_seconds=900,
+        now=now,
+    )
+    assert decision["reason"] == "poll_interval"
+    assert decision["delay_seconds"] == pytest.approx(50)
+
+
 def test_query_summary_options_and_runs(tmp_path):
     store = SQLiteStore(str(tmp_path / "cbg.sqlite3"))
     target = target_key_for_url(URL)
