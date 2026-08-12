@@ -478,9 +478,32 @@ class SQLiteStore:
             success = bool(result.get("success"))
             scan_mode = str(result.get("scan_mode") or "full")
             full_scan_at = finished_at if success and scan_mode == "full" else None
+            previous_checkpoint = connection.execute(
+                """
+                SELECT metadata_json FROM checkpoints
+                WHERE account_key = ? AND target_key = ?
+                """,
+                (account_key, target_key),
+            ).fetchone()
+            try:
+                previous_metadata = (
+                    json.loads(previous_checkpoint["metadata_json"])
+                    if previous_checkpoint
+                    else {}
+                )
+            except (TypeError, ValueError):
+                previous_metadata = {}
+            reported_total = result.get("reported_total")
+            if not isinstance(reported_total, int) or reported_total < 0:
+                reported_total = previous_metadata.get("reported_total")
+            collection_mode = str(result.get("collection_mode") or "").strip()
+            if not collection_mode or collection_mode == "unknown":
+                collection_mode = str(previous_metadata.get("collection_mode") or "")
             metadata = {
                 "captured_api_count": int(result.get("captured_api_count") or 0),
                 "scan_complete": bool(result.get("scan_complete")),
+                "reported_total": reported_total,
+                "collection_mode": collection_mode,
             }
             connection.execute(
                 """
@@ -727,13 +750,38 @@ class SQLiteStore:
                 """,
                 params,
             ).fetchone()
+            checkpoint_rows = connection.execute(
+                f"SELECT target_key, metadata_json FROM checkpoints {where}",
+                params,
+            ).fetchall()
+
+        totals_by_target: dict[str, int] = {}
+        collection_modes: set[str] = set()
+        for checkpoint in checkpoint_rows:
+            try:
+                metadata = json.loads(checkpoint["metadata_json"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            reported_total = metadata.get("reported_total")
+            if isinstance(reported_total, int) and reported_total >= 0:
+                key = str(checkpoint["target_key"])
+                totals_by_target[key] = max(totals_by_target.get(key, 0), reported_total)
+            collection_mode = str(metadata.get("collection_mode") or "")
+            if collection_mode:
+                collection_modes.add(collection_mode)
         return {
             "total": int(row["total"] or 0),
+            "reported_total": sum(totals_by_target.values()) or None,
             "stable": int(row["stable"] or 0),
             "fallback": int(row["fallback"] or 0),
             "changed_24h": int(row["changed_24h"] or 0),
             "latest_seen_at": row["latest_seen_at"],
             "last_run": dict(last_run) if last_run else None,
+            "collection_mode": (
+                next(iter(collection_modes))
+                if len(collection_modes) == 1
+                else "mixed" if collection_modes else ""
+            ),
         }
 
     def list_runs(

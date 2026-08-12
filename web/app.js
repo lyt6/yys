@@ -23,6 +23,7 @@ const elements = {
   empty: document.querySelector("#emptyState"),
   runs: document.querySelector("#runsList"),
   total: document.querySelector("#totalStat"),
+  reportedTotal: document.querySelector("#reportedTotalStat"),
   stable: document.querySelector("#stableStat"),
   fallback: document.querySelector("#fallbackStat"),
   changed: document.querySelector("#changedStat"),
@@ -146,6 +147,9 @@ function renderItems(payload) {
 
 function renderSummary(summary) {
   elements.total.textContent = formatNumber(summary.total);
+  elements.reportedTotal.textContent = summary.reported_total === null
+    ? "接口尚未报告总量"
+    : `官方查询报告 ${formatNumber(summary.reported_total)} 条`;
   elements.stable.textContent = formatNumber(summary.stable);
   elements.fallback.textContent = `降级键 ${formatNumber(summary.fallback)}`;
   elements.changed.textContent = formatNumber(summary.changed_24h);

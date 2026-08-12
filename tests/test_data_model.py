@@ -13,7 +13,7 @@ from data_model import (
 
 def captured(sequence, *items):
     return {
-        "url": "/cgi-bin/query.py",
+        "url": "/cgi/api/equip/list",
         "sequence": sequence,
         "json": {"status": 1, "equip_list": list(items)},
     }
@@ -159,13 +159,31 @@ def test_recommend_price_is_displayed_in_yuan_but_raw_detail_keeps_cents():
     assert item["detail"]["price"] == 18800
 
 
-def test_non_recommend_price_keeps_existing_units():
+def test_full_query_price_is_displayed_in_yuan():
     item = normalize_equipment_item(
         {"equip_id": "equip-a", "price": 18800},
-        source="/cgi-bin/query.py",
+        source="/cgi/api/query",
+    )
+
+    assert item["price"] == "188.00"
+
+
+def test_unrelated_api_price_keeps_existing_units():
+    item = normalize_equipment_item(
+        {"equip_id": "equip-a", "price": 18800},
+        source="/cgi/api/equip/list",
     )
 
     assert item["price"] == "18800"
+
+
+def test_query_top_level_level_description_is_preferred():
+    item = normalize_equipment_item(
+        {"eid": "equip-a", "level_desc": "60级", "equip_level": 60},
+        source="/cgi/api/query",
+    )
+
+    assert item["level"] == "60级"
 
 
 def test_fallback_identity_is_explicitly_marked_unstable():

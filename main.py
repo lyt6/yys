@@ -120,7 +120,7 @@ def run_locked_collector(
     headless = env_bool("CBG_HEADLESS", default=False)
     run_once = env_bool("CBG_RUN_ONCE", default=False)
     interval_seconds = env_int("CBG_POLL_INTERVAL_SECONDS", 60, 30)
-    max_pages = env_int("CBG_MAX_PAGES", 100, 1)
+    max_pages = env_int("CBG_MAX_PAGES", 1000, 1)
     incremental_pages = env_int("CBG_INCREMENTAL_PAGES", 20, 1)
     full_refresh_interval = env_int("CBG_FULL_REFRESH_INTERVAL_SECONDS", 3600, 300)
     scroll_delay = env_int("CBG_SCROLL_DELAY_MS", 3000, 1000)
@@ -129,6 +129,7 @@ def run_locked_collector(
     browser_start_attempts = env_int("CBG_BROWSER_START_ATTEMPTS", 3, 1)
     browser_retry_delay = env_int("CBG_BROWSER_RETRY_DELAY_SECONDS", 3, 1)
     ignore_restart_cooldown = env_bool("CBG_IGNORE_RESTART_COOLDOWN", default=False)
+    force_full_query = env_bool("CBG_FORCE_FULL_QUERY", default=True)
 
     try:
         store = SQLiteStore(database_path)
@@ -162,6 +163,11 @@ def run_locked_collector(
         f"每 {full_refresh_interval} 秒深扫，最多 {max_pages} 轮",
         flush=True,
     )
+    print(
+        "列表数据源: "
+        + ("官方普通查询（全量分页）" if force_full_query else "官网默认推荐流"),
+        flush=True,
+    )
     if ignore_restart_cooldown:
         print("重启保护: 已通过 CBG_IGNORE_RESTART_COOLDOWN 手工关闭一次", flush=True)
     elif initial_delay:
@@ -177,6 +183,7 @@ def run_locked_collector(
         user_data_dir=profile_dir,
         browser_start_attempts=browser_start_attempts,
         browser_retry_delay_seconds=browser_retry_delay,
+        force_full_query=force_full_query,
     )
 
     def persist_result(result: dict[str, Any]) -> dict[str, Any]:

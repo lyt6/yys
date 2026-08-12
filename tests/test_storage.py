@@ -219,6 +219,23 @@ def test_query_summary_options_and_runs(tmp_path):
     assert store.list_runs(account_key="one", limit=1)[0]["observed_count"] == 2
 
 
+def test_summary_reports_official_total_and_preserves_it_across_partial_runs(tmp_path):
+    store = SQLiteStore(str(tmp_path / "cbg.sqlite3"))
+    target = target_key_for_url(URL)
+    full = make_result([item("A")])
+    full.update({"reported_total": 10000, "collection_mode": "full_query"})
+    store.record_result("one", target, URL, full)
+
+    partial = make_result([item("A")], cycle=2, mode="incremental")
+    partial.update({"reported_total": None, "collection_mode": "unknown"})
+    store.record_result("one", target, URL, partial)
+
+    summary = store.get_summary("one", target)
+    assert summary["total"] == 1
+    assert summary["reported_total"] == 10000
+    assert summary["collection_mode"] == "full_query"
+
+
 def test_database_uses_wal_and_foreign_keys(tmp_path):
     path = tmp_path / "cbg.sqlite3"
     SQLiteStore(str(path))

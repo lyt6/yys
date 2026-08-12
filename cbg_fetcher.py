@@ -37,6 +37,7 @@ ALLOWED_API_HOSTS = {"yys.cbg.163.com"}
 DATA_API_EXACT_PATHS = {
     "/cgi-bin/recommend.py",
     "/cgi-bin/query.py",
+    "/cgi/api/query",
     "/cgi/api/equip",
     "/cgi/api/search",
 }
@@ -56,6 +57,38 @@ EQUIPMENT_CONTAINER_KEYS = {
 }
 WRAPPER_KEYS = {"data", "result"}
 PAGINATION_WRAPPER_KEYS = {"pager", "paging"}
+FULL_QUERY_API_PATHS = {"/cgi-bin/query.py", "/cgi/api/query"}
+RECOMMEND_API_PATH = "/cgi-bin/recommend.py"
+FULL_QUERY_INIT_SCRIPT = r"""
+(() => {
+    const enforceFullQuery = (value) => {
+        if (!value || typeof value !== "object") return value;
+        try {
+            Object.defineProperty(value, "open_recommd", {
+                configurable: true,
+                enumerable: true,
+                writable: false,
+                value: false,
+            });
+        } catch (_) {
+            try { value.open_recommd = false; } catch (_) {}
+        }
+        return value;
+    };
+
+    let currentConfig = enforceFullQuery(window.CBG_CONFIG);
+    try {
+        Object.defineProperty(window, "CBG_CONFIG", {
+            configurable: true,
+            enumerable: true,
+            get: () => currentConfig,
+            set: (value) => { currentConfig = enforceFullQuery(value); },
+        });
+    } catch (_) {
+        enforceFullQuery(window.CBG_CONFIG);
+    }
+})();
+"""
 LOGIN_AGREEMENT_CHECKBOX_SELECTOR = ", ".join(
     (
         '.fur-agree-4 input[type="checkbox"]',
@@ -125,6 +158,35 @@ def is_equipment_api(url: str) -> bool:
     return path in DATA_API_EXACT_PATHS or any(
         path.startswith(prefix) for prefix in DATA_API_PATH_PREFIXES
     )
+
+
+def is_full_query_api(url: str) -> bool:
+    """Identify the official paginated listing query, not the recommendation feed."""
+    return urlparse(str(url)).path.lower() in FULL_QUERY_API_PATHS
+
+
+def _payload_reported_total(data: Any) -> int | None:
+    """Read an explicit listing total without inferring it from page length."""
+    if not isinstance(data, dict):
+        return None
+    containers = [data]
+    containers.extend(
+        value
+        for key, value in data.items()
+        if str(key).lower() in PAGINATION_WRAPPER_KEYS and isinstance(value, dict)
+    )
+    for container in containers:
+        for key in ("total_num", "total_count", "total"):
+            value = container.get(key)
+            if isinstance(value, bool) or value in (None, ""):
+                continue
+            try:
+                total = int(str(value).replace(",", ""))
+            except (TypeError, ValueError):
+                continue
+            if total >= 0:
+                return total
+    return None
 
 
 def get_business_status(data: Any) -> str:
@@ -397,6 +459,7 @@ class CBGFetcher:
         browser_channel: str | None = None,
         browser_start_attempts: int | None = None,
         browser_retry_delay_seconds: int | None = None,
+        force_full_query: bool | None = None,
     ) -> None:
         profile_path = Path(user_data_dir)
         if not profile_path.is_absolute():
@@ -417,6 +480,12 @@ class CBGFetcher:
             browser_retry_delay_seconds,
             os.getenv("CBG_BROWSER_RETRY_DELAY_SECONDS"),
             default=3,
+        )
+        self.force_full_query = (
+            force_full_query
+            if force_full_query is not None
+            else os.getenv("CBG_FORCE_FULL_QUERY", "true").strip().lower()
+            in {"1", "true", "yes", "on"}
         )
         self._agreement_before_submit_snapshot: dict[str, Any] | None = None
 
@@ -457,6 +526,50 @@ class CBGFetcher:
                 await asyncio.sleep(delay)
         assert last_error is not None
         raise last_error
+
+    async def _install_full_query_mode(self, context) -> bool:
+        """Select the site's ordinary paginated query branch before page scripts run."""
+        if not self.force_full_query:
+            return False
+        installer = getattr(context, "add_init_script", None)
+        if not callable(installer):
+            return False
+        try:
+            await installer(script=FULL_QUERY_INIT_SCRIPT)
+            return True
+        except Exception as exc:
+            print(f">> [查询模式] 注入普通查询配置失败，将继续检测实际数据源: {exc}", flush=True)
+            return False
+
+    async def _enforce_full_query_mode(self, page) -> bool:
+        """Reassert the official client flag for requests triggered after navigation."""
+        if not self.force_full_query:
+            return False
+        evaluator = getattr(page, "evaluate", None)
+        if not callable(evaluator):
+            return False
+        try:
+            return bool(
+                await evaluator(
+                    """() => {
+                        const config = window.CBG_CONFIG;
+                        if (!config || typeof config !== 'object') return false;
+                        try {
+                            Object.defineProperty(config, 'open_recommd', {
+                                configurable: true,
+                                enumerable: true,
+                                writable: false,
+                                value: false,
+                            });
+                        } catch (_) {
+                            try { config.open_recommd = false; } catch (_) {}
+                        }
+                        return config.open_recommd === false;
+                    }"""
+                )
+            )
+        except Exception:
+            return False
 
     @staticmethod
     async def _close_context(context) -> None:
@@ -1026,7 +1139,7 @@ class CBGFetcher:
         username: str | None = None,
         password: str | None = None,
         headless: bool = False,
-        max_pages: int = 100,
+        max_pages: int = 1000,
         scroll_delay: int = 3000,
         idle_rounds: int = 3,
     ) -> dict[str, Any]:
@@ -1042,7 +1155,7 @@ class CBGFetcher:
         username: str | None = None,
         password: str | None = None,
         headless: bool = False,
-        max_pages: int = 100,
+        max_pages: int = 1000,
         scroll_delay: int = 3000,
         idle_rounds: int = 3,
     ) -> dict[str, Any]:
@@ -1071,7 +1184,7 @@ class CBGFetcher:
         result_handler,
         headless: bool = False,
         interval_seconds: int = 60,
-        max_pages: int = 100,
+        max_pages: int = 1000,
         incremental_pages: int = 20,
         full_refresh_interval_seconds: int = 3600,
         scroll_delay: int = 3000,
@@ -1111,7 +1224,7 @@ class CBGFetcher:
         result_handler,
         headless: bool = False,
         interval_seconds: int = 60,
-        max_pages: int = 100,
+        max_pages: int = 1000,
         incremental_pages: int = 20,
         full_refresh_interval_seconds: int = 3600,
         scroll_delay: int = 3000,
@@ -1340,7 +1453,11 @@ class CBGFetcher:
             "business_success_seen": False,
             "explicit_empty_seen": False,
             "explicit_api_end": False,
+            "explicit_recommend_end": False,
             "api_response_count": 0,
+            "query_api_response_count": 0,
+            "recommend_api_response_count": 0,
+            "reported_total": None,
         }
 
         def failure(error: str, auth_state: str, user_action: bool = False):
@@ -1363,6 +1480,9 @@ class CBGFetcher:
                 except Exception:
                     return
                 data = sanitize_sensitive_data(raw_data)
+                response_path = urlparse(response.url).path.lower()
+                full_query_response = response_path in FULL_QUERY_API_PATHS
+                recommend_response = response_path == RECOMMEND_API_PATH
                 status_code = get_business_status(data)
                 business_error = get_business_error(data)
                 if status_code == MOBILE_AUTH_STATUS:
@@ -1380,11 +1500,22 @@ class CBGFetcher:
                 if success and known_empty:
                     response_state["explicit_empty_seen"] = True
                 if success and (candidates or known_empty) and _payload_indicates_end(data):
-                    response_state["explicit_api_end"] = True
+                    if full_query_response:
+                        response_state["explicit_api_end"] = True
+                    elif recommend_response:
+                        response_state["explicit_recommend_end"] = True
+
+                if full_query_response:
+                    response_state["query_api_response_count"] += 1
+                    reported_total = _payload_reported_total(data)
+                    if reported_total is not None:
+                        response_state["reported_total"] = reported_total
+                elif recommend_response:
+                    response_state["recommend_api_response_count"] += 1
 
                 captured_data.append(
                     {
-                        "url": urlparse(response.url).path,
+                        "url": response_path,
                         "sequence": sequence,
                         "json": data,
                     }
@@ -1444,6 +1575,32 @@ class CBGFetcher:
                 )
             return None
 
+        def collection_mode() -> str:
+            if response_state["query_api_response_count"]:
+                return "full_query"
+            if response_state["recommend_api_response_count"]:
+                return "recommendation_fallback"
+            return "unknown"
+
+        def extract_observed(dom_info: dict[str, Any]) -> list[dict[str, Any]]:
+            query_seen = bool(response_state["query_api_response_count"])
+            api_data = (
+                [api for api in captured_data if is_full_query_api(str(api.get("url") or ""))]
+                if query_seen
+                else captured_data
+            )
+            dom_items = [] if query_seen else dom_info.get("equip_list", [])
+            return extract_structured_items(api_data, dom_items)
+
+        def reached_reported_total(observed_count: int) -> bool:
+            total = response_state.get("reported_total")
+            return (
+                bool(response_state["query_api_response_count"])
+                and isinstance(total, int)
+                and observed_count >= total
+            )
+
+        await self._install_full_query_mode(context)
         page = await context.new_page()
         page.on("response", schedule_response)
         try:
@@ -1451,6 +1608,7 @@ class CBGFetcher:
             try:
                 response_event.clear()
                 await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                await self._enforce_full_query_mode(page)
                 await wait_for_api_activity(min(max(scroll_delay, 1500), 5000))
             except Exception as exc:
                 return failure(f"页面加载失败: {exc}", "navigation_error")
@@ -1486,13 +1644,18 @@ class CBGFetcher:
                         "business_success_seen": False,
                         "explicit_empty_seen": False,
                         "explicit_api_end": False,
+                        "explicit_recommend_end": False,
                         "api_response_count": 0,
+                        "query_api_response_count": 0,
+                        "recommend_api_response_count": 0,
+                        "reported_total": None,
                     }
                 )
                 captured_data.clear()
                 try:
                     response_event.clear()
                     await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                    await self._enforce_full_query_mode(page)
                     await wait_for_api_activity(min(max(scroll_delay, 1500), 5000))
                 except Exception as exc:
                     return failure(f"登录后页面加载失败: {exc}", "navigation_error")
@@ -1514,12 +1677,18 @@ class CBGFetcher:
                 return state_failure
 
             dom_info = await self._async_extract_dom_equip_info(page)
-            observed = extract_structured_items(captured_data, dom_info.get("equip_list", []))
+            observed = extract_observed(dom_info)
             pages_scanned = 1
             last_observed_count = len(observed)
             no_growth_rounds = 0
-            scan_complete = bool(response_state["explicit_api_end"])
-            termination_reason = "api_end" if scan_complete else "max_rounds"
+            scan_complete = bool(response_state["explicit_api_end"]) or reached_reported_total(
+                len(observed)
+            )
+            termination_reason = (
+                "reported_total"
+                if reached_reported_total(len(observed))
+                else "api_end" if scan_complete else "max_rounds"
+            )
 
             for page_number in range(2, max(1, int(max_pages)) + 1):
                 if scan_complete:
@@ -1544,7 +1713,7 @@ class CBGFetcher:
                     return state_failure
 
                 dom_info = await self._async_extract_dom_equip_info(page)
-                observed = extract_structured_items(captured_data, dom_info.get("equip_list", []))
+                observed = extract_observed(dom_info)
                 current_count = len(observed)
                 changes = count_equipment_changes(known_items or [], observed)
                 if current_count > last_observed_count:
@@ -1563,7 +1732,14 @@ class CBGFetcher:
                     scan_complete = True
                     termination_reason = "api_end"
                     break
-                if await self._page_has_explicit_end_marker(page):
+                if reached_reported_total(current_count):
+                    scan_complete = True
+                    termination_reason = "reported_total"
+                    break
+                if (
+                    response_state["query_api_response_count"]
+                    and await self._page_has_explicit_end_marker(page)
+                ):
                     scan_complete = True
                     termination_reason = "dom_end"
                     break
@@ -1573,7 +1749,14 @@ class CBGFetcher:
 
             await drain_response_tasks()
             dom_info = await self._async_extract_dom_equip_info(page)
-            observed = extract_structured_items(captured_data, dom_info.get("equip_list", []))
+            observed = extract_observed(dom_info)
+            if (
+                not scan_complete
+                and collection_mode() == "recommendation_fallback"
+                and response_state["explicit_recommend_end"]
+                and termination_reason == "max_rounds"
+            ):
+                termination_reason = "recommendation_end"
 
             if not observed and not (
                 response_state["business_success_seen"] and response_state["explicit_empty_seen"]
@@ -1588,6 +1771,8 @@ class CBGFetcher:
                         "captured_api_count": len(captured_data),
                         "pages_scanned": pages_scanned,
                         "termination_reason": termination_reason,
+                        "collection_mode": collection_mode(),
+                        "reported_total": response_state.get("reported_total"),
                     }
                 )
                 return result
@@ -1609,6 +1794,12 @@ class CBGFetcher:
                 "pages_scanned": pages_scanned,
                 "scan_complete": scan_complete,
                 "termination_reason": termination_reason,
+                "collection_mode": collection_mode(),
+                "reported_total": response_state.get("reported_total"),
+                "query_api_response_count": response_state["query_api_response_count"],
+                "recommend_api_response_count": response_state[
+                    "recommend_api_response_count"
+                ],
                 "fallback_identity_count": sum(
                     1 for item in observed if not item.get("identity_stable")
                 ),
@@ -1735,6 +1926,14 @@ def format_equip_list(equip_data: dict[str, Any]) -> str:
         return "\n".join(lines)
 
     lines.append(f"持久快照项目: {len(equip_data.get('equip_list', []))} 个")
+    mode = equip_data.get("collection_mode")
+    if mode:
+        lines.append(
+            "列表数据源: "
+            + ("官方普通查询" if mode == "full_query" else "推荐流降级（非全量）")
+        )
+    if equip_data.get("reported_total") is not None:
+        lines.append(f"官方查询报告总量: {equip_data['reported_total']} 个")
     if equip_data.get("incremental_item_count") is not None:
         lines.append(f"本轮观察项目: {equip_data['incremental_item_count']} 个")
     if equip_data.get("changes_detected") is not None:

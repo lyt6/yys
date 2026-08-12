@@ -13,6 +13,7 @@ from cbg_fetcher import (
     LOGIN_AGREEMENT_ERROR_SELECTOR,
     CBGFetcher,
     _payload_indicates_end,
+    _payload_reported_total,
     _run_async,
     extract_structured_items,
     format_equip_list,
@@ -20,6 +21,7 @@ from cbg_fetcher import (
     get_business_status,
     is_business_success,
     is_equipment_api,
+    is_full_query_api,
     parse_cbg_url,
     summarize_api_payloads,
 )
@@ -234,7 +236,20 @@ def test_api_allowlist_rejects_foreign_or_similar_urls(url):
 
 def test_api_allowlist_accepts_expected_equipment_paths():
     assert is_equipment_api("https://yys.cbg.163.com/cgi-bin/query.py?page=2")
+    assert is_equipment_api("https://yys.cbg.163.com/cgi/api/query?page=2")
     assert is_equipment_api("https://yys.cbg.163.com/cgi/api/equip/list?page=2")
+
+
+def test_full_query_classifier_excludes_recommendation_feed():
+    assert is_full_query_api("https://yys.cbg.163.com/cgi/api/query?page=2")
+    assert is_full_query_api("/cgi-bin/query.py")
+    assert not is_full_query_api("https://yys.cbg.163.com/cgi-bin/recommend.py")
+
+
+def test_reported_total_uses_only_explicit_total_fields():
+    assert _payload_reported_total({"total_num": 10000, "result": [1, 2]}) == 10000
+    assert _payload_reported_total({"paging": {"total_count": "9,876"}}) == 9876
+    assert _payload_reported_total({"result": [1, 2]}) is None
 
 
 def test_generic_id_only_metadata_is_not_treated_as_listing():
@@ -289,7 +304,7 @@ def test_dom_fallback_does_not_duplicate_matching_api_display():
     captured = [
         {
             "sequence": 1,
-            "url": "/cgi-bin/query.py",
+            "url": "/cgi/api/equip/list",
             "json": {"equip_list": [{"equip_id": "A", "equip_name": "项目", "price": "100"}]},
         }
     ]
@@ -591,8 +606,8 @@ def test_login_rechecks_agreement_prompt_and_submits_again():
 class FakeResponse:
     status = 200
 
-    def __init__(self, payload):
-        self.url = "https://yys.cbg.163.com/cgi-bin/query.py?page=1"
+    def __init__(self, payload, url="https://yys.cbg.163.com/cgi-bin/query.py?page=1"):
+        self.url = url
         self._payload = payload
 
     async def json(self):
@@ -605,9 +620,10 @@ class FakeLocator:
 
 
 class FakePage:
-    def __init__(self, payload):
+    def __init__(self, payload, response_url="https://yys.cbg.163.com/cgi-bin/query.py?page=1"):
         self.url = TARGET_URL
         self.payload = payload
+        self.response_url = response_url
         self.listener = None
         self.closed = False
 
@@ -621,7 +637,7 @@ class FakePage:
 
     async def goto(self, url, wait_until=None, timeout=None):
         self.url = url
-        self.listener(FakeResponse(self.payload))
+        self.listener(FakeResponse(self.payload, self.response_url))
 
     def locator(self, selector):
         return FakeLocator()
@@ -636,6 +652,17 @@ class FakeContext:
 
     async def new_page(self):
         return self.page
+
+
+def test_full_query_mode_is_installed_before_navigation():
+    context = MagicMock()
+    context.add_init_script = AsyncMock()
+    fetcher = CBGFetcher(force_full_query=True)
+
+    assert asyncio.run(fetcher._install_full_query_mode(context)) is True
+    script = context.add_init_script.await_args.kwargs["script"]
+    assert "open_recommd" in script
+    assert "value: false" in script
 
 
 def test_fetch_context_waits_for_response_and_accepts_explicit_api_end():
@@ -684,6 +711,66 @@ def test_fetch_context_treats_confirmed_empty_list_as_success():
     )
     assert result["success"] is True
     assert result["equip_list"] == []
+
+
+def test_full_query_reported_total_marks_complete_without_recommendation_semantics():
+    page = FakePage(
+        {
+            "status": 1,
+            "total_num": 1,
+            "paging": {"is_last_page": False},
+            "result": [{"eid": "A", "format_equip_name": "项目", "price": 100}],
+        },
+        response_url="https://yys.cbg.163.com/cgi/api/query?page=1",
+    )
+    fetcher = CBGFetcher()
+    fetcher._async_extract_dom_equip_info = AsyncMock(
+        return_value={"title": "测试", "equip_list": [], "raw_dom": {}}
+    )
+    fetcher._page_requires_mobile_auth = AsyncMock(return_value=False)
+
+    result = asyncio.run(
+        fetcher._async_fetch_in_context(FakeContext(page), TARGET_URL, None, None, 5, 1000, 2, [])
+    )
+
+    assert result["success"] is True
+    assert result["collection_mode"] == "full_query"
+    assert result["reported_total"] == 1
+    assert result["scan_complete"] is True
+    assert result["termination_reason"] == "reported_total"
+
+
+def test_recommendation_end_is_not_reported_as_full_coverage():
+    page = FakePage(
+        {
+            "status": "OK",
+            "status_code": "OK",
+            "paging": {"is_last_page": True},
+            "result": [
+                {
+                    "serverid": "server-a",
+                    "game_ordersn": "order-a",
+                    "format_equip_name": "推荐项目",
+                    "price": 100,
+                }
+            ],
+        },
+        response_url="https://yys.cbg.163.com/cgi-bin/recommend.py?page=100",
+    )
+    fetcher = CBGFetcher()
+    fetcher._async_extract_dom_equip_info = AsyncMock(
+        return_value={"title": "测试", "equip_list": [], "raw_dom": {}}
+    )
+    fetcher._page_requires_mobile_auth = AsyncMock(return_value=False)
+
+    result = asyncio.run(
+        fetcher._async_fetch_in_context(FakeContext(page), TARGET_URL, None, None, 1, 1000, 2, [])
+    )
+
+    assert result["success"] is True
+    assert result["collection_mode"] == "recommendation_fallback"
+    assert result["scan_complete"] is False
+    assert result["termination_reason"] == "recommendation_end"
 
 
 def test_browser_launch_retries_transient_profile_failure(tmp_path):

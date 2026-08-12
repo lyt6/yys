@@ -71,6 +71,7 @@ VOLATILE_KEYS = {
     "view_count",
     "click_count",
     "collect_count",
+    "collect_num",
     "online_num",
 }
 
@@ -111,9 +112,14 @@ def _scalar_text(value: Any) -> str:
 
 
 def _display_price(value: Any, source: str) -> str:
-    """Convert the known recommend endpoint's cent price while retaining raw detail."""
+    """Convert current CBG role-list prices from cents while retaining raw detail."""
     text = _scalar_text(value)
-    if not text or "/cgi-bin/recommend.py" not in str(source).lower():
+    cent_price_paths = (
+        "/cgi-bin/recommend.py",
+        "/cgi-bin/query.py",
+        "/cgi/api/query",
+    )
+    if not text or not any(path in str(source).lower() for path in cent_price_paths):
         return text
     try:
         return f"{Decimal(text) / Decimal(100):.2f}"
@@ -191,6 +197,7 @@ def normalize_equipment_item(
     price = _display_price(raw_price, source)
     level = _scalar_text(
         clean_raw.get("level")
+        or clean_raw.get("level_desc")
         or clean_raw.get("equip_level")
         or nested.get("level_desc")
     )
