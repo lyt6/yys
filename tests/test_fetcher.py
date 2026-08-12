@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from cbg_fetcher import (
+    EMAIL_AGREEMENT_CONTROL_SELECTOR,
+    EMAIL_AGREEMENT_SELECTED_CLASS,
     LOGIN_AGREEMENT_CHECKBOX_SELECTOR,
     LOGIN_AGREEMENT_CONTROL_SELECTOR,
     LOGIN_AGREEMENT_ERROR_SELECTOR,
@@ -140,10 +142,19 @@ class FakeAgreementLabel(FakeAgreementElement):
 
 
 class FakeAgreementFrame:
-    def __init__(self, *, checkboxes=(), controls=(), errors=(), text=()):
+    def __init__(
+        self,
+        *,
+        checkboxes=(),
+        controls=(),
+        email_controls=(),
+        errors=(),
+        text=(),
+    ):
         self.collections = {
             LOGIN_AGREEMENT_CHECKBOX_SELECTOR: FakeLocatorCollection(checkboxes),
             LOGIN_AGREEMENT_CONTROL_SELECTOR: FakeLocatorCollection(controls),
+            EMAIL_AGREEMENT_CONTROL_SELECTOR: FakeLocatorCollection(email_controls),
             LOGIN_AGREEMENT_ERROR_SELECTOR: FakeLocatorCollection(errors),
         }
         self.text = list(text)
@@ -154,6 +165,32 @@ class FakeAgreementFrame:
     def get_by_text(self, marker, exact=False):
         matches = [element for element in self.text if marker in element.message]
         return FakeLocatorCollection(matches)
+
+
+class FakeEmailAgreementControl:
+    """Model the current email skin's inverse hidden-input semantics."""
+
+    def __init__(self, *, selected=False, visible=True):
+        self.selected = selected
+        self.visible = visible
+        self.hidden_input_checked = not selected
+        self.click_count = 0
+
+    async def is_visible(self, timeout=None):
+        return self.visible
+
+    async def get_attribute(self, name):
+        if name == "class":
+            classes = "u-dl-agree j-mail-clause-span"
+            if self.selected:
+                classes += f" {EMAIL_AGREEMENT_SELECTED_CLASS}"
+            return classes
+        return None
+
+    async def click(self, force=False, timeout=None):
+        self.click_count += 1
+        self.selected = not self.selected
+        self.hidden_input_checked = not self.selected
 
 
 class CurrentNetEaseAgreementFrame:
@@ -304,6 +341,45 @@ def test_login_agreement_checks_all_matching_native_inputs():
     assert first.check_count == second.check_count == 1
 
 
+def test_email_agreement_uses_selected_class_not_inverse_hidden_input():
+    control = FakeEmailAgreementControl(selected=False)
+    assert control.hidden_input_checked is True
+    frame = FakeAgreementFrame(email_controls=[control])
+
+    assert asyncio.run(CBGFetcher()._ensure_login_agreement(frame)) is True
+    assert control.selected is True
+    assert control.hidden_input_checked is False
+    assert control.click_count == 1
+
+
+def test_email_agreement_does_not_reclick_already_selected_control():
+    control = FakeEmailAgreementControl(selected=True)
+    frame = FakeAgreementFrame(email_controls=[control])
+
+    assert asyncio.run(CBGFetcher()._ensure_login_agreement(frame)) is True
+    assert control.selected is True
+    assert control.click_count == 0
+
+
+def test_forced_email_agreement_retry_finishes_selected():
+    control = FakeEmailAgreementControl(selected=True)
+    frame = FakeAgreementFrame(email_controls=[control])
+
+    assert asyncio.run(CBGFetcher()._ensure_login_agreement(frame, force=True)) is True
+    assert control.selected is True
+    assert control.hidden_input_checked is False
+    assert control.click_count == 2
+
+
+def test_forced_email_agreement_retry_clicks_once_when_unselected():
+    control = FakeEmailAgreementControl(selected=False)
+    frame = FakeAgreementFrame(email_controls=[control])
+
+    assert asyncio.run(CBGFetcher()._ensure_login_agreement(frame, force=True)) is True
+    assert control.selected is True
+    assert control.click_count == 1
+
+
 def test_login_agreement_covers_current_netease_sibling_checkbox_dom():
     checkbox = FakeAgreementElement(native=True)
     frame = CurrentNetEaseAgreementFrame(checkbox)
@@ -311,7 +387,7 @@ def test_login_agreement_covers_current_netease_sibling_checkbox_dom():
     assert checkbox.checked is True
 
 
-def test_login_agreement_triggers_email_form_component_handler():
+def test_login_agreement_triggers_generic_component_handler():
     checkbox = FakeAgreementElement(native=True)
     visual_toggle = FakeVisualAgreementToggle(checkbox)
     label = FakeAgreementLabel(FakeAgreementRow(checkbox), checkbox)
@@ -329,7 +405,7 @@ def test_login_agreement_triggers_email_form_component_handler():
     assert checkbox.check_count == 0
 
 
-def test_forced_agreement_retry_triggers_handler_even_if_dom_is_checked():
+def test_forced_generic_agreement_retry_triggers_handler():
     checkbox = FakeAgreementElement(native=True, checked=True)
     label = FakeAgreementLabel(FakeAgreementRow(checkbox), checkbox)
     frame = FakeAgreementFrame(checkboxes=[checkbox], text=[label])

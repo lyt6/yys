@@ -104,6 +104,8 @@ LOGIN_AGREEMENT_ERROR_MARKERS = (
 LOGIN_AGREEMENT_TEXT_MARKERS = (
     "阅读并同意",
 )
+EMAIL_AGREEMENT_CONTROL_SELECTOR = "span.j-mail-clause-span"
+EMAIL_AGREEMENT_SELECTED_CLASS = "u-dl-agree-select"
 
 
 def parse_cbg_url(url: str) -> dict[str, str]:
@@ -383,6 +385,7 @@ class CBGFetcher:
             os.getenv("CBG_BROWSER_RETRY_DELAY_SECONDS"),
             default=3,
         )
+        self._agreement_before_submit_snapshot: dict[str, Any] | None = None
 
     @staticmethod
     def _positive_setting(explicit: int | None, environment: str | None, default: int) -> int:
@@ -466,7 +469,14 @@ class CBGFetcher:
             class_name = str(await control.get_attribute("class") or "").lower()
             if any(
                 marker in class_name
-                for marker in ("checked", "selected", "is-active", "is-on", "agree-ok")
+                for marker in (
+                    "checked",
+                    "selected",
+                    "u-dl-agree-select",
+                    "is-active",
+                    "is-on",
+                    "agree-ok",
+                )
             ):
                 return True
         except Exception:
@@ -497,6 +507,71 @@ class CBGFetcher:
         except Exception:
             return False
 
+    @staticmethod
+    async def _email_agreement_is_selected(control) -> bool:
+        try:
+            class_name = str(await control.get_attribute("class") or "")
+            return EMAIL_AGREEMENT_SELECTED_CLASS in class_name.split()
+        except Exception:
+            return False
+
+    async def _wait_for_email_agreement_state(
+        self,
+        control,
+        expected: bool,
+    ) -> bool:
+        for _ in range(6):
+            if await self._email_agreement_is_selected(control) is expected:
+                return True
+            await asyncio.sleep(0.1)
+        return False
+
+    async def _ensure_email_login_agreement(
+        self,
+        login_frame,
+        *,
+        force: bool = False,
+    ) -> tuple[bool, bool]:
+        """Handle the current email skin whose hidden checkbox has inverse semantics."""
+        try:
+            controls = login_frame.locator(EMAIL_AGREEMENT_CONTROL_SELECTOR)
+            control_count = await controls.count()
+        except Exception:
+            return False, False
+
+        found = False
+        for index in range(control_count):
+            control = controls.nth(index)
+            try:
+                if not await control.is_visible(timeout=500):
+                    continue
+                found = True
+                selected = await self._email_agreement_is_selected(control)
+                if selected and not force:
+                    return True, True
+
+                # A forced retry replays a genuine deselect/select sequence only
+                # when the component itself reports selected. Never infer this
+                # state from the nested input: its checked value is inverted in
+                # the current NetEase email-login skin.
+                if selected:
+                    try:
+                        await control.click(timeout=2000)
+                    except Exception:
+                        await control.click(force=True, timeout=2000)
+                    if not await self._wait_for_email_agreement_state(control, False):
+                        continue
+
+                try:
+                    await control.click(timeout=2000)
+                except Exception:
+                    await control.click(force=True, timeout=2000)
+                if await self._wait_for_email_agreement_state(control, True):
+                    return True, True
+            except Exception:
+                continue
+        return found, False
+
     async def _set_agreement_checkbox(self, checkbox, *, force: bool = False) -> bool:
         """Toggle through the visible square first so NetEase's UI handler also runs."""
         try:
@@ -509,10 +584,9 @@ class CBGFetcher:
             if await checkbox.is_checked(timeout=500):
                 return True
 
-            # The current email form renders the visible square on the parent
-            # span (`u-zc-agree`) and keeps the native input inside it. Clicking
-            # that span is important: force-checking only the input can leave the
-            # component's visual/application state unchanged.
+            # Other/mobile skins render the visible square on the parent span
+            # and use ordinary checkbox semantics. The email skin is handled by
+            # `_ensure_email_login_agreement` before this fallback is reached.
             try:
                 visual_toggle = checkbox.locator("xpath=..")
                 if await visual_toggle.is_visible(timeout=500):
@@ -582,11 +656,6 @@ class CBGFetcher:
                         ):
                             return True, True
 
-                    # NetEase's current email form keeps the visual square and
-                    # agreement text as siblings. Its application state is
-                    # updated by the text/row click handler; changing only the
-                    # nested input can look checked to Playwright while submit
-                    # still reports that the agreement was not accepted.
                     await label.click(force=force, timeout=2000)
                     for checkbox_index in range(checkbox_count):
                         checkbox = checkboxes.nth(checkbox_index)
@@ -596,8 +665,6 @@ class CBGFetcher:
                         elif await checkbox.get_attribute("aria-checked") == "true":
                             return True, True
 
-                    # Fall back to the visible square only when the component's
-                    # agreement handler did not expose a checked state.
                     for checkbox_index in range(checkbox_count):
                         checkbox = checkboxes.nth(checkbox_index)
                         if await self._set_agreement_checkbox(checkbox, force=force):
@@ -611,12 +678,29 @@ class CBGFetcher:
 
     async def _ensure_login_agreement(self, login_frame, *, force: bool = False) -> bool:
         """Click the visible agreement square and verify its underlying state."""
+        email_found, email_selected = await self._ensure_email_login_agreement(
+            login_frame,
+            force=force,
+        )
+        if email_found:
+            if not email_selected:
+                print(">> [登录] 邮箱协议方框存在，但未能切换到选中状态。", flush=True)
+                return False
+            self._agreement_before_submit_snapshot = (
+                await self._capture_agreement_row_snapshot(login_frame)
+            )
+            print(">> [登录] 已点击邮箱协议方框并确认组件选中状态。", flush=True)
+            return True
+
         found, checked = await self._check_agreement_next_to_text(
             login_frame,
             force=force,
         )
         if checked:
-            print(">> [登录] 已触发协议组件并稳定校验勾选状态。", flush=True)
+            self._agreement_before_submit_snapshot = (
+                await self._capture_agreement_row_snapshot(login_frame)
+            )
+            print(">> [登录] 已真实点击协议框并稳定校验勾选状态。", flush=True)
             return True
 
         checkbox_count = 0
@@ -678,6 +762,107 @@ class CBGFetcher:
             return True
         print(">> [登录] 协议控件存在，但无法完成勾选。", flush=True)
         return False
+
+    @staticmethod
+    async def _capture_agreement_row_snapshot(login_frame) -> dict[str, Any] | None:
+        """Capture only the small agreement row; never include credential fields."""
+        for marker in LOGIN_AGREEMENT_TEXT_MARKERS:
+            try:
+                labels = login_frame.get_by_text(marker, exact=False)
+                label_count = await labels.count()
+            except Exception:
+                continue
+            for index in range(label_count):
+                try:
+                    label = labels.nth(index)
+                    if not await label.is_visible(timeout=300):
+                        continue
+                    row = label.locator(
+                        "xpath=ancestor-or-self::*[.//input[@type='checkbox'] "
+                        "or .//*[@role='checkbox']][1]"
+                    )
+                    if not await row.count():
+                        continue
+                    box = await row.bounding_box(timeout=500)
+                    if (
+                        not box
+                        or float(box.get("height", 0)) > 160
+                        or float(box.get("width", 0)) > 1600
+                    ):
+                        continue
+                    states = []
+                    checkboxes = row.locator(
+                        'input[type="checkbox"], [role="checkbox"]'
+                    )
+                    for checkbox_index in range(await checkboxes.count()):
+                        checkbox = checkboxes.nth(checkbox_index)
+                        checkbox_type = await checkbox.get_attribute("type")
+                        checked = (
+                            await checkbox.is_checked(timeout=300)
+                            if checkbox_type == "checkbox"
+                            else await checkbox.get_attribute("aria-checked") == "true"
+                        )
+                        states.append(
+                            {
+                                "type": checkbox_type or "custom",
+                                "checked": checked,
+                                "visible": await checkbox.is_visible(timeout=300),
+                                "class": await checkbox.get_attribute("class") or "",
+                            }
+                        )
+                    email_controls = row.locator(EMAIL_AGREEMENT_CONTROL_SELECTOR)
+                    email_class = ""
+                    if await email_controls.count():
+                        email_class = (
+                            await email_controls.first.get_attribute("class") or ""
+                        )
+                    return {
+                        "png": await row.screenshot(type="png", timeout=2000),
+                        "states": states,
+                        "email_selected": (
+                            EMAIL_AGREEMENT_SELECTED_CLASS in email_class.split()
+                        ),
+                        "email_control_class": email_class,
+                    }
+                except Exception:
+                    continue
+        return None
+
+    async def _save_agreement_failure_diagnostics(self, login_frame) -> None:
+        """Persist sanitized before/after agreement-row images after repeated failure."""
+        try:
+            after = await self._capture_agreement_row_snapshot(login_frame)
+            before = self._agreement_before_submit_snapshot
+            diagnostic_dir = Path(__file__).resolve().parent / "data" / "login_diagnostics"
+            diagnostic_dir.mkdir(parents=True, exist_ok=True)
+            paths = []
+            if before and before.get("png"):
+                before_path = diagnostic_dir / "agreement_before_submit.png"
+                before_path.write_bytes(before["png"])
+                paths.append(str(before_path))
+                print(
+                    ">> [登录诊断] 提交前协议状态: "
+                    f"email_selected={before.get('email_selected')}, "
+                    f"inputs={before.get('states', [])}",
+                    flush=True,
+                )
+            if after and after.get("png"):
+                after_path = diagnostic_dir / "agreement_after_reject.png"
+                after_path.write_bytes(after["png"])
+                paths.append(str(after_path))
+                print(
+                    ">> [登录诊断] 拒绝后协议状态: "
+                    f"email_selected={after.get('email_selected')}, "
+                    f"inputs={after.get('states', [])}",
+                    flush=True,
+                )
+            if paths:
+                print(
+                    ">> [登录诊断] 已保存仅包含协议行的截图: " + ", ".join(paths),
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f">> [登录诊断] 无法保存协议行截图: {exc}", flush=True)
 
     @staticmethod
     async def _login_agreement_error_visible(login_frame) -> bool:
@@ -759,6 +944,7 @@ class CBGFetcher:
             if not await self._login_agreement_error_visible(login_frame):
                 break
             if submit_attempt == 1:
+                await self._save_agreement_failure_diagnostics(login_frame)
                 print(">> [登录] 登录页仍提示必须同意协议，已停止本次提交。", flush=True)
                 return False
             print(">> [登录] 登录页提示协议未勾选，正在强制重试一次。", flush=True)
