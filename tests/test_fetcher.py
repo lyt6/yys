@@ -121,9 +121,17 @@ class FakeAgreementRow:
 
 
 class FakeAgreementLabel(FakeAgreementElement):
-    def __init__(self, row):
+    def __init__(self, row, checkbox=None):
         super().__init__(visible=True, message="已阅读并同意《平台服务协议》和《隐私政策》")
         self.row = row
+        self.checkbox = checkbox
+        self.component_accepted = False
+
+    async def click(self, force=False, timeout=None):
+        self.click_count += 1
+        self.component_accepted = True
+        if self.checkbox is not None:
+            self.checkbox.checked = True
 
     def locator(self, selector):
         if selector.startswith("xpath=ancestor-or-self::"):
@@ -303,10 +311,10 @@ def test_login_agreement_covers_current_netease_sibling_checkbox_dom():
     assert checkbox.checked is True
 
 
-def test_login_agreement_clicks_visible_square_in_email_form_row():
+def test_login_agreement_triggers_email_form_component_handler():
     checkbox = FakeAgreementElement(native=True)
     visual_toggle = FakeVisualAgreementToggle(checkbox)
-    label = FakeAgreementLabel(FakeAgreementRow(checkbox))
+    label = FakeAgreementLabel(FakeAgreementRow(checkbox), checkbox)
     frame = FakeAgreementFrame(
         checkboxes=[checkbox],
         controls=[visual_toggle],
@@ -314,10 +322,21 @@ def test_login_agreement_clicks_visible_square_in_email_form_row():
     )
 
     assert asyncio.run(CBGFetcher()._ensure_login_agreement(frame)) is True
-    assert visual_toggle.click_count == 1
-    assert visual_toggle.visual_checked is True
+    assert label.click_count == 1
+    assert label.component_accepted is True
+    assert visual_toggle.click_count == 0
     assert checkbox.checked is True
     assert checkbox.check_count == 0
+
+
+def test_forced_agreement_retry_triggers_handler_even_if_dom_is_checked():
+    checkbox = FakeAgreementElement(native=True, checked=True)
+    label = FakeAgreementLabel(FakeAgreementRow(checkbox), checkbox)
+    frame = FakeAgreementFrame(checkboxes=[checkbox], text=[label])
+
+    assert asyncio.run(CBGFetcher()._ensure_login_agreement(frame, force=True)) is True
+    assert label.click_count == 1
+    assert label.component_accepted is True
 
 
 def test_login_agreement_skips_hidden_first_control_and_clicks_visible_one():

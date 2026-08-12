@@ -102,8 +102,6 @@ LOGIN_AGREEMENT_ERROR_MARKERS = (
     "请先同意",
 )
 LOGIN_AGREEMENT_TEXT_MARKERS = (
-    "已阅读并同意",
-    "我已阅读并同意",
     "阅读并同意",
 )
 
@@ -534,6 +532,17 @@ class CBGFetcher:
         except Exception:
             return False
 
+    @staticmethod
+    async def _native_checkbox_stays_checked(checkbox) -> bool:
+        """Reject transient DOM-only checks that the login component immediately resets."""
+        try:
+            if not await checkbox.is_checked(timeout=500):
+                return False
+            await asyncio.sleep(0.25)
+            return await checkbox.is_checked(timeout=500)
+        except Exception:
+            return False
+
     async def _check_agreement_next_to_text(
         self,
         login_frame,
@@ -563,12 +572,39 @@ class CBGFetcher:
                     checkboxes = row.locator(
                         'input[type="checkbox"], [role="checkbox"]'
                     )
-                    for checkbox_index in range(await checkboxes.count()):
-                        if await self._set_agreement_checkbox(
-                            checkboxes.nth(checkbox_index),
-                            force=force,
+                    checkbox_count = await checkboxes.count()
+                    for checkbox_index in range(checkbox_count):
+                        checkbox = checkboxes.nth(checkbox_index)
+                        if (
+                            not force
+                            and await checkbox.get_attribute("type") == "checkbox"
+                            and await self._native_checkbox_stays_checked(checkbox)
                         ):
                             return True, True
+
+                    # NetEase's current email form keeps the visual square and
+                    # agreement text as siblings. Its application state is
+                    # updated by the text/row click handler; changing only the
+                    # nested input can look checked to Playwright while submit
+                    # still reports that the agreement was not accepted.
+                    await label.click(force=force, timeout=2000)
+                    for checkbox_index in range(checkbox_count):
+                        checkbox = checkboxes.nth(checkbox_index)
+                        if await checkbox.get_attribute("type") == "checkbox":
+                            if await self._native_checkbox_stays_checked(checkbox):
+                                return True, True
+                        elif await checkbox.get_attribute("aria-checked") == "true":
+                            return True, True
+
+                    # Fall back to the visible square only when the component's
+                    # agreement handler did not expose a checked state.
+                    for checkbox_index in range(checkbox_count):
+                        checkbox = checkboxes.nth(checkbox_index)
+                        if await self._set_agreement_checkbox(checkbox, force=force):
+                            if await checkbox.get_attribute("type") != "checkbox":
+                                return True, True
+                            if await self._native_checkbox_stays_checked(checkbox):
+                                return True, True
                 except Exception:
                     continue
         return found, False
@@ -580,7 +616,7 @@ class CBGFetcher:
             force=force,
         )
         if checked:
-            print(">> [登录] 已点击可见方框并校验登录协议。", flush=True)
+            print(">> [登录] 已触发协议组件并稳定校验勾选状态。", flush=True)
             return True
 
         checkbox_count = 0
