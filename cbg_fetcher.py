@@ -73,6 +73,8 @@ LOGIN_AGREEMENT_CHECKBOX_SELECTOR = ", ".join(
 )
 LOGIN_AGREEMENT_CONTROL_SELECTOR = ", ".join(
     (
+        "div.fur-agree-4 > span.u-zc-agree",
+        "span.u-zc-agree",
         "span.u-dl-agree",
         "span.j-mail-clause-span",
         "div.m-mail-clause > span:first-child",
@@ -91,11 +93,18 @@ LOGIN_AGREEMENT_ERROR_SELECTOR = ", ".join(
     )
 )
 LOGIN_AGREEMENT_ERROR_MARKERS = (
+    "需要同意相关条款",
+    "需要同意协议",
     "请先阅读并同意",
     "请阅读并同意",
     "请先勾选",
     "请勾选",
     "请先同意",
+)
+LOGIN_AGREEMENT_TEXT_MARKERS = (
+    "已阅读并同意",
+    "我已阅读并同意",
+    "阅读并同意",
 )
 
 
@@ -457,45 +466,129 @@ class CBGFetcher:
             if await control.get_attribute("data-checked") == "true":
                 return True
             class_name = str(await control.get_attribute("class") or "").lower()
-            return any(
+            if any(
                 marker in class_name
                 for marker in ("checked", "selected", "is-active", "is-on", "agree-ok")
+            ):
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(
+                await control.evaluate(
+                    """
+                    element => {
+                        const nodes = [element, ...element.querySelectorAll('*')];
+                        return nodes.some(node => {
+                            if (node instanceof HTMLInputElement && node.type === 'checkbox') {
+                                return node.checked && !node.indeterminate;
+                            }
+                            const ariaChecked = node.getAttribute?.('aria-checked');
+                            const dataChecked = node.getAttribute?.('data-checked');
+                            const className = String(node.className || '').toLowerCase();
+                            return ariaChecked === 'true'
+                                || dataChecked === 'true'
+                                || /(^|[\\s_-])(checked|selected|active|on)([\\s_-]|$)/.test(
+                                    className
+                                );
+                        });
+                    }
+                    """
+                )
             )
         except Exception:
             return False
 
-    async def _ensure_login_agreement(self, login_frame, *, force: bool = False) -> bool:
-        """Select the visible login agreement and verify native state when exposed."""
+    async def _set_agreement_checkbox(self, checkbox, *, force: bool = False) -> bool:
+        """Toggle through the visible square first so NetEase's UI handler also runs."""
+        try:
+            is_native = await checkbox.get_attribute("type") == "checkbox"
+            if not is_native:
+                if await checkbox.get_attribute("aria-checked") != "true":
+                    await checkbox.click(force=force, timeout=2000)
+                return await checkbox.get_attribute("aria-checked") == "true"
+
+            if await checkbox.is_checked(timeout=500):
+                return True
+
+            # The current email form renders the visible square on the parent
+            # span (`u-zc-agree`) and keeps the native input inside it. Clicking
+            # that span is important: force-checking only the input can leave the
+            # component's visual/application state unchanged.
+            try:
+                visual_toggle = checkbox.locator("xpath=..")
+                if await visual_toggle.is_visible(timeout=500):
+                    await visual_toggle.click(force=force, timeout=2000)
+            except Exception:
+                pass
+            if await checkbox.is_checked(timeout=500):
+                return True
+
+            try:
+                await checkbox.check(force=force, timeout=2000)
+            except Exception:
+                if force:
+                    raise
+                await checkbox.check(force=True, timeout=2000)
+            return await checkbox.is_checked(timeout=500)
+        except Exception:
+            return False
+
+    async def _check_agreement_next_to_text(
+        self,
+        login_frame,
+        *,
+        force: bool = False,
+    ) -> tuple[bool, bool]:
+        """Find the checkbox in the same visible row as the agreement wording."""
         found = False
+        for marker in LOGIN_AGREEMENT_TEXT_MARKERS:
+            try:
+                labels = login_frame.get_by_text(marker, exact=False)
+                label_count = await labels.count()
+            except Exception:
+                continue
+            for index in range(label_count):
+                label = labels.nth(index)
+                try:
+                    if not await label.is_visible(timeout=500):
+                        continue
+                    found = True
+                    row = label.locator(
+                        "xpath=ancestor-or-self::*[.//input[@type='checkbox'] "
+                        "or .//*[@role='checkbox']][1]"
+                    )
+                    if not await row.count():
+                        continue
+                    checkboxes = row.locator(
+                        'input[type="checkbox"], [role="checkbox"]'
+                    )
+                    for checkbox_index in range(await checkboxes.count()):
+                        if await self._set_agreement_checkbox(
+                            checkboxes.nth(checkbox_index),
+                            force=force,
+                        ):
+                            return True, True
+                except Exception:
+                    continue
+        return found, False
+
+    async def _ensure_login_agreement(self, login_frame, *, force: bool = False) -> bool:
+        """Click the visible agreement square and verify its underlying state."""
+        found, checked = await self._check_agreement_next_to_text(
+            login_frame,
+            force=force,
+        )
+        if checked:
+            print(">> [登录] 已点击可见方框并校验登录协议。", flush=True)
+            return True
+
         checkbox_count = 0
-        checked_count = 0
         try:
             checkboxes = login_frame.locator(LOGIN_AGREEMENT_CHECKBOX_SELECTOR)
             checkbox_count = await checkboxes.count()
         except Exception:
             checkboxes = None
-
-        for index in range(checkbox_count):
-            checkbox = checkboxes.nth(index)
-            found = True
-            try:
-                is_native = await checkbox.get_attribute("type") == "checkbox"
-                if is_native:
-                    if not await checkbox.is_checked(timeout=500):
-                        await checkbox.check(force=True, timeout=2000)
-                    if await checkbox.is_checked(timeout=500):
-                        checked_count += 1
-                else:
-                    if await checkbox.get_attribute("aria-checked") != "true":
-                        await checkbox.click(force=force, timeout=2000)
-                    if await checkbox.get_attribute("aria-checked") == "true":
-                        checked_count += 1
-            except Exception:
-                continue
-
-        if checkbox_count and checked_count == checkbox_count:
-            print(">> [登录] 已勾选并校验登录协议。", flush=True)
-            return True
 
         try:
             controls = login_frame.locator(LOGIN_AGREEMENT_CONTROL_SELECTOR)
@@ -513,6 +606,19 @@ class CBGFetcher:
                 if await self._agreement_control_reports_checked(control):
                     print(">> [登录] 登录协议已处于勾选状态。", flush=True)
                     return True
+                try:
+                    nested = control.locator(
+                        'input[type="checkbox"], [role="checkbox"]'
+                    )
+                    for checkbox_index in range(await nested.count()):
+                        if await self._set_agreement_checkbox(
+                            nested.nth(checkbox_index),
+                            force=force,
+                        ):
+                            print(">> [登录] 已点击可见方框并校验登录协议。", flush=True)
+                            return True
+                except Exception:
+                    pass
                 await control.click(force=force, timeout=2000)
                 if await self._agreement_control_reports_checked(control):
                     print(">> [登录] 已勾选并校验登录协议。", flush=True)
@@ -521,6 +627,15 @@ class CBGFetcher:
                 return True
             except Exception:
                 continue
+
+        checked_count = 0
+        for index in range(checkbox_count):
+            found = True
+            if await self._set_agreement_checkbox(checkboxes.nth(index), force=force):
+                checked_count += 1
+        if checkbox_count and checked_count == checkbox_count:
+            print(">> [登录] 已勾选并校验登录协议。", flush=True)
+            return True
 
         if not found:
             print(">> [登录] 当前登录表单未显示协议勾选控件。", flush=True)
@@ -534,7 +649,8 @@ class CBGFetcher:
             errors = login_frame.locator(LOGIN_AGREEMENT_ERROR_SELECTOR)
             count = await errors.count()
         except Exception:
-            return False
+            errors = None
+            count = 0
         for index in range(count):
             error = errors.nth(index)
             try:
@@ -543,6 +659,16 @@ class CBGFetcher:
                 message = str(await error.inner_text(timeout=500) or "")
                 if any(marker in message for marker in LOGIN_AGREEMENT_ERROR_MARKERS):
                     return True
+            except Exception:
+                continue
+        # The current email form renders this warning as ordinary red text rather
+        # than consistently using one of the historical error classes.
+        for marker in LOGIN_AGREEMENT_ERROR_MARKERS:
+            try:
+                messages = login_frame.get_by_text(marker, exact=False)
+                for index in range(await messages.count()):
+                    if await messages.nth(index).is_visible(timeout=300):
+                        return True
             except Exception:
                 continue
         return False

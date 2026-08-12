@@ -53,6 +53,7 @@ class FakeAgreementElement:
         self.message = message
         self.click_count = 0
         self.check_count = 0
+        self.parent = None
 
     async def get_attribute(self, name):
         if name == "type":
@@ -81,17 +82,70 @@ class FakeAgreementElement:
     async def inner_text(self, timeout=None):
         return self.message
 
+    def locator(self, selector):
+        if selector == "xpath=.." and self.parent is not None:
+            return self.parent
+        return FakeLocatorCollection()
+
+
+class FakeVisualAgreementToggle(FakeAgreementElement):
+    def __init__(self, checkbox):
+        super().__init__(visible=True)
+        self.checkbox = checkbox
+        self.visual_checked = False
+        checkbox.parent = self
+
+    async def click(self, force=False, timeout=None):
+        self.click_count += 1
+        self.visual_checked = True
+        self.checked = True
+        self.checkbox.checked = True
+
+    def locator(self, selector):
+        if 'input[type="checkbox"]' in selector:
+            return FakeLocatorCollection([self.checkbox])
+        return FakeLocatorCollection()
+
+
+class FakeAgreementRow:
+    def __init__(self, checkbox):
+        self.checkbox = checkbox
+
+    async def count(self):
+        return 1
+
+    def locator(self, selector):
+        if 'input[type="checkbox"]' in selector:
+            return FakeLocatorCollection([self.checkbox])
+        return FakeLocatorCollection()
+
+
+class FakeAgreementLabel(FakeAgreementElement):
+    def __init__(self, row):
+        super().__init__(visible=True, message="已阅读并同意《平台服务协议》和《隐私政策》")
+        self.row = row
+
+    def locator(self, selector):
+        if selector.startswith("xpath=ancestor-or-self::"):
+            return self.row
+        return FakeLocatorCollection()
+
 
 class FakeAgreementFrame:
-    def __init__(self, *, checkboxes=(), controls=(), errors=()):
+    def __init__(self, *, checkboxes=(), controls=(), errors=(), text=()):
         self.collections = {
             LOGIN_AGREEMENT_CHECKBOX_SELECTOR: FakeLocatorCollection(checkboxes),
             LOGIN_AGREEMENT_CONTROL_SELECTOR: FakeLocatorCollection(controls),
             LOGIN_AGREEMENT_ERROR_SELECTOR: FakeLocatorCollection(errors),
         }
+        self.text = list(text)
 
     def locator(self, selector):
         return self.collections.get(selector, FakeLocatorCollection())
+
+    def get_by_text(self, marker, exact=False):
+        matches = [element for element in self.text if marker in element.message]
+        return FakeLocatorCollection(matches)
 
 
 class CurrentNetEaseAgreementFrame:
@@ -249,6 +303,23 @@ def test_login_agreement_covers_current_netease_sibling_checkbox_dom():
     assert checkbox.checked is True
 
 
+def test_login_agreement_clicks_visible_square_in_email_form_row():
+    checkbox = FakeAgreementElement(native=True)
+    visual_toggle = FakeVisualAgreementToggle(checkbox)
+    label = FakeAgreementLabel(FakeAgreementRow(checkbox))
+    frame = FakeAgreementFrame(
+        checkboxes=[checkbox],
+        controls=[visual_toggle],
+        text=[label],
+    )
+
+    assert asyncio.run(CBGFetcher()._ensure_login_agreement(frame)) is True
+    assert visual_toggle.click_count == 1
+    assert visual_toggle.visual_checked is True
+    assert checkbox.checked is True
+    assert checkbox.check_count == 0
+
+
 def test_login_agreement_skips_hidden_first_control_and_clicks_visible_one():
     hidden = FakeAgreementElement(visible=False)
     visible = FakeAgreementElement(visible=True)
@@ -263,6 +334,15 @@ def test_login_agreement_error_only_uses_visible_error_message():
     hidden = FakeAgreementElement(visible=False, message="请先勾选登录协议")
     visible = FakeAgreementElement(visible=True, message="请先阅读并同意服务条款")
     frame = FakeAgreementFrame(errors=[hidden, visible])
+    assert asyncio.run(CBGFetcher._login_agreement_error_visible(frame)) is True
+
+
+def test_login_agreement_detects_current_plain_text_warning():
+    warning = FakeAgreementElement(
+        visible=True,
+        message="您需要同意相关条款才能登录",
+    )
+    frame = FakeAgreementFrame(text=[warning])
     assert asyncio.run(CBGFetcher._login_agreement_error_visible(frame)) is True
 
 
