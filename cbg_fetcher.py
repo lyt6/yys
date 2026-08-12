@@ -1,0 +1,1246 @@
+"""Browser-based NetEase CBG collector with deterministic upsert semantics."""
+
+from __future__ import annotations
+
+import asyncio
+import csv
+import inspect
+import json
+import os
+import tempfile
+import time
+from datetime import datetime, timezone
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+from data_model import (
+    count_equipment_changes,
+    deduplicate_items,
+    equipment_identity_key,
+    is_sensitive_key,
+    merge_equipment_snapshots,
+    normalize_equipment_item,
+    sanitize_sensitive_data,
+)
+
+try:
+    from playwright.async_api import async_playwright
+
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    async_playwright = None
+    PLAYWRIGHT_AVAILABLE = False
+
+
+MOBILE_AUTH_STATUS = "MOBILE_AUTH"
+SUCCESS_STATUS_CODES = {"", "OK", "SUCCESS"}
+ALLOWED_API_HOSTS = {"yys.cbg.163.com"}
+DATA_API_EXACT_PATHS = {
+    "/cgi-bin/recommend.py",
+    "/cgi-bin/query.py",
+    "/cgi/api/equip",
+    "/cgi/api/search",
+}
+DATA_API_PATH_PREFIXES = (
+    "/cgi/api/equip/",
+    "/cgi/api/search/",
+)
+EQUIPMENT_CONTAINER_KEYS = {
+    "equip",
+    "equip_desc",
+    "equip_list",
+    "equips",
+    "items",
+    "records",
+    "rows",
+    "selling_list",
+}
+WRAPPER_KEYS = {"data", "result"}
+
+
+def parse_cbg_url(url: str) -> dict[str, str]:
+    """Parse URL parameters without inventing equivalence between fields."""
+    parsed = urlparse(url)
+    query_params = parse_qs(parsed.query)
+    return {key: values[0] for key, values in query_params.items() if values}
+
+
+def is_equipment_api(url: str) -> bool:
+    """Allow only HTTPS equipment APIs on the expected CBG host."""
+    parsed = urlparse(url)
+    if parsed.scheme.lower() != "https" or parsed.hostname not in ALLOWED_API_HOSTS:
+        return False
+    path = parsed.path.lower()
+    return path in DATA_API_EXACT_PATHS or any(
+        path.startswith(prefix) for prefix in DATA_API_PATH_PREFIXES
+    )
+
+
+def get_business_status(data: Any) -> str:
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("status_code") or "").upper()
+
+
+def is_business_success(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return False
+    status_code = get_business_status(data)
+    status = data.get("status")
+    if status_code not in SUCCESS_STATUS_CODES:
+        return False
+    if status is None:
+        return status_code in {"OK", "SUCCESS"}
+    return str(status).strip().lower() in {"1", "true", "ok", "success"}
+
+
+def get_business_error(data: Any) -> str:
+    if not isinstance(data, dict):
+        return ""
+    status_code = get_business_status(data)
+    if status_code and status_code not in SUCCESS_STATUS_CODES:
+        return status_code
+    if "status" in data and not is_business_success(data):
+        return f"STATUS_{data.get('status')}"
+    return ""
+
+
+def _run_async(coro):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    coro.close()
+    raise RuntimeError("当前线程已有事件循环，请直接调用对应的 async_* 方法")
+
+
+def _looks_like_equipment(value: dict[str, Any]) -> bool:
+    has_id = any(
+        value.get(key) not in (None, "")
+        for key in ("equip_id", "listing_id", "ordersn", "order_sn", "id", "sn")
+    )
+    has_name = any(value.get(key) not in (None, "") for key in ("equip_name", "name", "title"))
+    has_listing_field = any(
+        key in value for key in ("price", "price_desc", "level", "equip_level", "equip_desc")
+    )
+    return (has_id and (has_name or has_listing_field)) or (has_name and has_listing_field)
+
+
+def _find_equipment_candidates(data: Any) -> list[dict[str, Any]]:
+    """Find listing objects only below known result/list containers."""
+    candidates: list[dict[str, Any]] = []
+    seen_objects: set[int] = set()
+
+    def add(value: Any) -> None:
+        if (
+            isinstance(value, dict)
+            and id(value) not in seen_objects
+            and _looks_like_equipment(value)
+        ):
+            seen_objects.add(id(value))
+            candidates.append(value)
+
+    def visit(value: Any, hinted: bool = False, depth: int = 0) -> None:
+        if depth > 8:
+            return
+        if isinstance(value, list):
+            for child in value:
+                if hinted:
+                    add(child)
+                visit(child, hinted, depth + 1)
+            return
+        if not isinstance(value, dict):
+            return
+        if hinted:
+            add(value)
+        for key, child in value.items():
+            normalized = str(key).lower()
+            wrapper_contains_items = normalized in WRAPPER_KEYS and (
+                isinstance(child, list)
+                or (isinstance(child, dict) and _looks_like_equipment(child))
+            )
+            child_hinted = normalized in EQUIPMENT_CONTAINER_KEYS or wrapper_contains_items
+            if normalized in WRAPPER_KEYS or child_hinted:
+                visit(child, child_hinted, depth + 1)
+
+    visit(data, isinstance(data, list))
+    return candidates
+
+
+def _payload_has_known_empty_list(data: Any) -> bool:
+    found = False
+
+    def visit(value: Any, depth: int = 0) -> None:
+        nonlocal found
+        if found or depth > 8 or not isinstance(value, dict):
+            return
+        for key, child in value.items():
+            normalized = str(key).lower()
+            if normalized in EQUIPMENT_CONTAINER_KEYS | WRAPPER_KEYS and child == []:
+                found = True
+                return
+            if normalized in WRAPPER_KEYS or normalized in EQUIPMENT_CONTAINER_KEYS:
+                if isinstance(child, dict):
+                    visit(child, depth + 1)
+
+    visit(data)
+    return found
+
+
+def _payload_indicates_end(data: Any) -> bool:
+    """Return true only for an explicit pagination-end field."""
+    if not isinstance(data, dict):
+        return False
+    false_means_end = {"has_more", "has_next", "has_next_page", "more"}
+    true_means_end = {"is_end", "is_last", "last_page", "no_more"}
+
+    def visit(value: Any, depth: int = 0) -> bool:
+        if depth > 7 or not isinstance(value, dict):
+            return False
+        for key, child in value.items():
+            normalized = str(key).lower()
+            if normalized in false_means_end and child is False:
+                return True
+            if normalized in true_means_end and child is True:
+                return True
+            if normalized in WRAPPER_KEYS and visit(child, depth + 1):
+                return True
+        return False
+
+    return visit(data)
+
+
+def extract_structured_items(
+    captured_apis: list[dict[str, Any]],
+    dom_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Normalize responses; stable IDs deduplicate independently of display text."""
+    normalized: list[dict[str, Any]] = []
+    ordered_apis = sorted(
+        enumerate(captured_apis),
+        key=lambda pair: (int(pair[1].get("sequence") or pair[0]), pair[0]),
+    )
+    for fallback_sequence, api in ordered_apis:
+        data = api.get("json", {})
+        if not isinstance(data, (dict, list)):
+            continue
+        sequence = int(api.get("sequence") or fallback_sequence)
+        for raw in _find_equipment_candidates(data):
+            normalized.append(
+                normalize_equipment_item(
+                    raw,
+                    source=str(api.get("url") or "api"),
+                    response_sequence=sequence,
+                )
+            )
+
+    api_display_keys = {
+        (str(item.get("name") or "").strip(), str(item.get("price") or "").strip())
+        for item in normalized
+    }
+    for dom_item in dom_items:
+        if not isinstance(dom_item, dict):
+            continue
+        display_key = (
+            str(dom_item.get("name") or "").strip(),
+            str(dom_item.get("price") or "").strip(),
+        )
+        if not display_key[0] or display_key in api_display_keys:
+            continue
+        normalized.append(normalize_equipment_item(dom_item, source="dom", response_sequence=0))
+    return deduplicate_items(normalized)
+
+
+def _equipment_identity(item: dict[str, Any]) -> tuple[str, str]:
+    """Backward-compatible tuple wrapper used by older callers/tests."""
+    identity = equipment_identity_key(item)
+    return ("id" if not identity.startswith("display:") else "display", identity)
+
+
+def summarize_api_payloads(
+    captured_apis: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return schema-only diagnostics, never response values."""
+    summaries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for api in sorted(
+        captured_apis,
+        key=lambda item: int(item.get("sequence") or 0),
+        reverse=True,
+    ):
+        data = api.get("json")
+        list_paths: list[str] = []
+
+        def visit(
+            value: Any,
+            path: str,
+            depth: int,
+            paths: list[str] = list_paths,
+        ) -> None:
+            if depth > 5 or len(paths) >= 20:
+                return
+            if isinstance(value, list):
+                paths.append(f"{path}[{len(value)}]")
+                if value:
+                    visit(value[0], f"{path}[]", depth + 1)
+            elif isinstance(value, dict):
+                for key, child in value.items():
+                    if not is_sensitive_key(str(key)):
+                        visit(child, f"{path}.{key}", depth + 1)
+
+        visit(data, "$", 0)
+        summary = {
+            "endpoint": api.get("url", ""),
+            "status_code": get_business_status(data),
+            "top_keys": sorted(data.keys())[:30] if isinstance(data, dict) else [],
+            "list_paths": list_paths,
+            "root_type": type(data).__name__,
+        }
+        fingerprint = json.dumps(summary, ensure_ascii=False, sort_keys=True)
+        if fingerprint not in seen:
+            seen.add(fingerprint)
+            summaries.append(summary)
+        if len(summaries) >= 5:
+            break
+    return summaries
+
+
+def _atomic_json_write(value: Any, filepath: str) -> None:
+    directory = os.path.abspath(os.path.dirname(filepath) or ".")
+    os.makedirs(directory, exist_ok=True)
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=directory,
+            prefix=f".{os.path.basename(filepath)}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = handle.name
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, filepath)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def export_to_json(equip_data: dict[str, Any], filepath: str = "equip_data.json") -> str:
+    exportable = {
+        key: equip_data[key]
+        for key in (
+            "success",
+            "error",
+            "auth_state",
+            "needs_user_action",
+            "refer_sn",
+            "params",
+            "title",
+            "equip_list",
+            "cycle",
+            "started_at",
+            "fetched_at",
+            "pages_scanned",
+            "scan_complete",
+            "termination_reason",
+            "scan_mode",
+            "incremental_item_count",
+            "snapshot_item_count",
+            "changes_detected",
+            "full_refreshed_at",
+            "snapshot_may_include_stale",
+            "storage_stats",
+            "database_path",
+        )
+        if key in equip_data
+    }
+    _atomic_json_write(sanitize_sensitive_data(exportable), filepath)
+    return filepath
+
+
+def export_to_csv(equip_data: dict[str, Any], filepath: str = "equip_data.csv") -> str:
+    directory = os.path.abspath(os.path.dirname(filepath) or ".")
+    os.makedirs(directory, exist_ok=True)
+    fieldnames = [
+        "identity",
+        "id",
+        "id_kind",
+        "name",
+        "price",
+        "level",
+        "source",
+        "first_seen_at",
+        "last_seen_at",
+        "last_changed_at",
+        "seen_count",
+        "desc",
+    ]
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8-sig",
+            newline="",
+            dir=directory,
+            prefix=f".{os.path.basename(filepath)}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = handle.name
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for item in equip_data.get("equip_list", []):
+                detail = sanitize_sensitive_data(item.get("detail", {}))
+                writer.writerow(
+                    {
+                        "identity": item.get("identity", ""),
+                        "id": item.get("id", ""),
+                        "id_kind": item.get("id_kind", ""),
+                        "name": item.get("name", ""),
+                        "price": item.get("price", ""),
+                        "level": item.get("level", ""),
+                        "source": item.get("source", ""),
+                        "first_seen_at": item.get("first_seen_at", ""),
+                        "last_seen_at": item.get("last_seen_at", ""),
+                        "last_changed_at": item.get("last_changed_at", ""),
+                        "seen_count": item.get("seen_count", ""),
+                        "desc": json.dumps(detail, ensure_ascii=False, default=str),
+                    }
+                )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, filepath)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+    return filepath
+
+
+class CBGFetcher:
+    BASE_LOGIN_URL = "https://yys.cbg.163.com/cgi/mweb/show_login"
+
+    def __init__(
+        self,
+        user_data_dir: str = "./browser_profile_stable",
+        browser_channel: str | None = None,
+    ) -> None:
+        self.user_data_dir = user_data_dir
+        configured = (
+            browser_channel
+            if browser_channel is not None
+            else os.getenv("CBG_BROWSER_CHANNEL", "chrome")
+        )
+        self.browser_channel = configured.strip() or None
+
+    def _persistent_context_options(self, headless: bool) -> dict[str, Any]:
+        options: dict[str, Any] = {
+            "user_data_dir": self.user_data_dir,
+            "headless": headless,
+        }
+        if self.browser_channel:
+            options["channel"] = self.browser_channel
+        return options
+
+    def login(
+        self,
+        username: str,
+        password: str,
+        headless: bool = False,
+        timeout: int = 30000,
+    ) -> bool:
+        return _run_async(self.async_login(username, password, headless, timeout))
+
+    async def async_login(
+        self,
+        username: str,
+        password: str,
+        headless: bool = False,
+        timeout: int = 30000,
+    ) -> bool:
+        if not PLAYWRIGHT_AVAILABLE:
+            raise RuntimeError("Playwright 未安装")
+        async with async_playwright() as playwright:
+            os.makedirs(self.user_data_dir, exist_ok=True)
+            context = await playwright.chromium.launch_persistent_context(
+                **self._persistent_context_options(headless)
+            )
+            try:
+                page = context.pages[0] if context.pages else await context.new_page()
+                return await self._do_login_in_page(page, context, username, password, timeout)
+            finally:
+                await context.close()
+
+    async def _do_login_in_page(
+        self,
+        page,
+        context,
+        username: str,
+        password: str,
+        timeout: int = 30000,
+    ) -> bool:
+        target_url = f"{self.BASE_LOGIN_URL}?back_url=%2Fcgi%2Fmweb%2Fpl"
+        print(">> [登录] 正在加载网易藏宝阁登录页面...", flush=True)
+        await page.goto(target_url, wait_until="domcontentloaded", timeout=timeout)
+        await page.wait_for_timeout(1200)
+
+        login_frame = next(
+            (frame for frame in page.frames if "reg.163.com" in frame.url.lower()),
+            page,
+        )
+        try:
+            account_tab = login_frame.locator("div.u-head1").first
+            if await account_tab.is_visible(timeout=1500):
+                await account_tab.click()
+        except Exception:
+            pass
+
+        username_input = login_frame.locator('input[name="email"], input.dlemail, #phoneipt').first
+        password_input = login_frame.locator('input[name="password"], input.dlpwd').first
+        if not await username_input.is_visible(timeout=5000):
+            print(">> [登录] 未找到账号输入框，登录页结构可能已变化。", flush=True)
+            return False
+        if not await password_input.is_visible(timeout=5000):
+            print(">> [登录] 未找到密码输入框，登录页结构可能已变化。", flush=True)
+            return False
+
+        print(">> [登录] 正在填写登录凭据...", flush=True)
+        await username_input.fill(username)
+        await password_input.fill(password)
+        try:
+            agreement = login_frame.locator(
+                "span.u-dl-agree, span.j-mail-clause-span, "
+                "div.m-mail-clause span, div.m-mail-clause, div.fur-agree"
+            ).first
+            if await agreement.is_visible(timeout=1500):
+                await agreement.click()
+        except Exception:
+            pass
+
+        login_button = login_frame.locator("a.u-loginbtn, div.loginbox a").first
+        if not await login_button.is_visible(timeout=5000):
+            print(">> [登录] 未找到登录按钮。", flush=True)
+            return False
+        print(">> [登录] 正在提交登录...", flush=True)
+        await login_button.click()
+        try:
+            await page.wait_for_url(lambda current: not self._is_login_page(current), timeout=10000)
+        except Exception:
+            await page.wait_for_timeout(1500)
+
+        cookie_names = {cookie["name"] for cookie in await context.cookies()}
+        cookie_candidate = bool(
+            cookie_names.intersection({"sid", "cbg_sid", "NTES_SESS", "S_INFO"})
+        )
+        if cookie_candidate:
+            print(">> [登录] 已建立候选登录态，正在验证装备接口...", flush=True)
+        else:
+            print(">> [登录] 登录表单已提交，正在由目标接口验证结果...", flush=True)
+        # Cookie 名称不是稳定协议。提交成功后始终转到目标页，由目标页面、
+        # 手机验证状态和装备接口响应共同给出最终认证结论。
+        return True
+
+    @staticmethod
+    def _failure_result(
+        url: str,
+        error: str,
+        auth_state: str,
+        needs_user_action: bool = False,
+    ) -> dict[str, Any]:
+        params = parse_cbg_url(url)
+        return {
+            "success": False,
+            "error": error,
+            "auth_state": auth_state,
+            "needs_user_action": needs_user_action,
+            "refer_sn": params.get("refer_sn", ""),
+            "params": params,
+            "equip_list": [],
+            "observed_equip_list": [],
+            "captured_apis": [],
+        }
+
+    def fetch_equip_data(
+        self,
+        url: str,
+        username: str | None = None,
+        password: str | None = None,
+        headless: bool = False,
+        max_pages: int = 100,
+        scroll_delay: int = 3000,
+        idle_rounds: int = 3,
+    ) -> dict[str, Any]:
+        return _run_async(
+            self.async_fetch_equip_data(
+                url, username, password, headless, max_pages, scroll_delay, idle_rounds
+            )
+        )
+
+    async def async_fetch_equip_data(
+        self,
+        url: str,
+        username: str | None = None,
+        password: str | None = None,
+        headless: bool = False,
+        max_pages: int = 100,
+        scroll_delay: int = 3000,
+        idle_rounds: int = 3,
+    ) -> dict[str, Any]:
+        if not PLAYWRIGHT_AVAILABLE:
+            return self._failure_result(
+                url, "Playwright 未安装，无法启动浏览器。", "browser_unavailable"
+            )
+        async with async_playwright() as playwright:
+            os.makedirs(self.user_data_dir, exist_ok=True)
+            try:
+                context = await playwright.chromium.launch_persistent_context(
+                    **self._persistent_context_options(headless)
+                )
+            except Exception as exc:
+                return self._failure_result(url, f"浏览器启动失败: {exc}", "browser_unavailable")
+            try:
+                return await self._async_fetch_in_context(
+                    context, url, username, password, max_pages, scroll_delay, idle_rounds, []
+                )
+            finally:
+                await context.close()
+
+    def poll_equip_data(
+        self,
+        url: str,
+        username: str | None,
+        password: str | None,
+        result_handler,
+        headless: bool = False,
+        interval_seconds: int = 60,
+        max_pages: int = 100,
+        incremental_pages: int = 20,
+        full_refresh_interval_seconds: int = 3600,
+        scroll_delay: int = 3000,
+        idle_rounds: int = 3,
+        max_cycles: int | None = None,
+        initial_items: list[dict[str, Any]] | None = None,
+        checkpoint: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return _run_async(
+            self.async_poll_equip_data(
+                url=url,
+                username=username,
+                password=password,
+                result_handler=result_handler,
+                headless=headless,
+                interval_seconds=interval_seconds,
+                max_pages=max_pages,
+                incremental_pages=incremental_pages,
+                full_refresh_interval_seconds=full_refresh_interval_seconds,
+                scroll_delay=scroll_delay,
+                idle_rounds=idle_rounds,
+                max_cycles=max_cycles,
+                initial_items=initial_items,
+                checkpoint=checkpoint,
+            )
+        )
+
+    async def async_poll_equip_data(
+        self,
+        url: str,
+        username: str | None,
+        password: str | None,
+        result_handler,
+        headless: bool = False,
+        interval_seconds: int = 60,
+        max_pages: int = 100,
+        incremental_pages: int = 20,
+        full_refresh_interval_seconds: int = 3600,
+        scroll_delay: int = 3000,
+        idle_rounds: int = 3,
+        max_cycles: int | None = None,
+        initial_items: list[dict[str, Any]] | None = None,
+        checkpoint: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not PLAYWRIGHT_AVAILABLE:
+            result = self._failure_result(
+                url, "Playwright 未安装，无法启动轮询服务。", "browser_unavailable"
+            )
+            handled = result_handler(result, 1)
+            if inspect.isawaitable(handled):
+                await handled
+            return result
+
+        interval_seconds = max(30, int(interval_seconds))
+        max_pages = max(1, int(max_pages))
+        incremental_pages = max(1, int(incremental_pages))
+        full_refresh_interval_seconds = max(interval_seconds, int(full_refresh_interval_seconds))
+        state = dict(checkpoint or {})
+        snapshot_items = deduplicate_items(initial_items or [])
+        cycle = int(state.get("last_cycle") or 0)
+        full_refreshed_at = state.get("last_full_scan_at")
+
+        full_due_in = 0.0
+        if full_refreshed_at:
+            try:
+                previous_full = datetime.fromisoformat(str(full_refreshed_at))
+                if previous_full.tzinfo is None:
+                    previous_full = previous_full.replace(tzinfo=timezone.utc)
+                elapsed = max(
+                    0.0,
+                    (datetime.now(timezone.utc) - previous_full).total_seconds(),
+                )
+                full_due_in = max(0.0, full_refresh_interval_seconds - elapsed)
+            except ValueError:
+                full_due_in = 0.0
+        if state and not bool(state.get("last_full_scan_complete")):
+            full_due_in = 0.0
+
+        stop_states = {
+            "access_denied",
+            "browser_unavailable",
+            "business_error",
+            "login_required",
+            "mobile_verification_required",
+            "rate_limited",
+        }
+        consecutive_failures = 0
+        executed = 0
+        next_poll_at = time.monotonic()
+        next_full_at = time.monotonic() + full_due_in
+        last_result = self._failure_result(url, "尚未执行抓取", "not_started")
+
+        async with async_playwright() as playwright:
+            os.makedirs(self.user_data_dir, exist_ok=True)
+            try:
+                context = await playwright.chromium.launch_persistent_context(
+                    **self._persistent_context_options(headless)
+                )
+            except Exception as exc:
+                result = self._failure_result(url, f"浏览器启动失败: {exc}", "browser_unavailable")
+                handled = result_handler(result, cycle + 1)
+                if inspect.isawaitable(handled):
+                    await handled
+                return result
+
+            try:
+                while max_cycles is None or executed < max_cycles:
+                    started_monotonic = time.monotonic()
+                    started_at = datetime.now(timezone.utc).isoformat()
+                    cycle += 1
+                    executed += 1
+                    is_full_refresh = started_monotonic >= next_full_at
+                    scan_mode = "full" if is_full_refresh else "incremental"
+                    scan_rounds = max_pages if is_full_refresh else incremental_pages
+                    print(
+                        f">> [轮询] 第 {cycle} 轮：{'深度扫描' if is_full_refresh else '增量扫描'}",
+                        flush=True,
+                    )
+                    fetched = await self._async_fetch_in_context(
+                        context,
+                        url,
+                        username,
+                        password,
+                        scan_rounds,
+                        scroll_delay,
+                        idle_rounds,
+                        snapshot_items,
+                    )
+                    fetched_at = datetime.now(timezone.utc).isoformat()
+                    last_result = dict(fetched)
+                    last_result.update(
+                        {
+                            "cycle": cycle,
+                            "started_at": started_at,
+                            "fetched_at": fetched_at,
+                            "scan_mode": scan_mode,
+                        }
+                    )
+
+                    if last_result.get("success"):
+                        observed = deduplicate_items(last_result.get("equip_list", []))
+                        last_result["observed_equip_list"] = observed
+                        snapshot_items = merge_equipment_snapshots(snapshot_items, observed)
+                        last_result["incremental_item_count"] = len(observed)
+                        last_result["equip_list"] = list(snapshot_items)
+                        last_result["snapshot_item_count"] = len(snapshot_items)
+                        if is_full_refresh:
+                            full_refreshed_at = fetched_at
+                            next_full_at = started_monotonic + full_refresh_interval_seconds
+                        last_result["full_refreshed_at"] = full_refreshed_at
+                        last_result["snapshot_may_include_stale"] = bool(snapshot_items)
+
+                    handled = result_handler(last_result, cycle)
+                    if inspect.isawaitable(handled):
+                        await handled
+
+                    if last_result.get("success"):
+                        consecutive_failures = 0
+                    else:
+                        consecutive_failures += 1
+                        if last_result.get("auth_state") in stop_states:
+                            break
+                        if consecutive_failures >= 3:
+                            last_result["error"] = (
+                                f"{last_result.get('error', '抓取失败')}；"
+                                "连续失败 3 次，轮询已停止。"
+                            )
+                            break
+
+                    if max_cycles is not None and executed >= max_cycles:
+                        break
+                    next_poll_at += interval_seconds
+                    now = time.monotonic()
+                    while next_poll_at <= now:
+                        next_poll_at += interval_seconds
+                    await asyncio.sleep(max(0.0, next_poll_at - now))
+                return last_result
+            finally:
+                await context.close()
+
+    async def _async_fetch_in_context(
+        self,
+        context,
+        url: str,
+        username: str | None,
+        password: str | None,
+        max_pages: int,
+        scroll_delay: int,
+        idle_rounds: int,
+        known_items: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        params = parse_cbg_url(url)
+        captured_data: list[dict[str, Any]] = []
+        pending_tasks: set[asyncio.Task] = set()
+        response_event = asyncio.Event()
+        response_sequence = 0
+        response_state: dict[str, Any] = {
+            "mobile_auth": False,
+            "http_status": 0,
+            "last_business_error": "",
+            "last_business_error_sequence": -1,
+            "last_success_sequence": -1,
+            "business_success_seen": False,
+            "explicit_empty_seen": False,
+            "explicit_api_end": False,
+            "api_response_count": 0,
+        }
+
+        def failure(error: str, auth_state: str, user_action: bool = False):
+            result = self._failure_result(url, error, auth_state, user_action)
+            result["captured_api_count"] = len(captured_data)
+            return result
+
+        async def drain_response_tasks() -> None:
+            while pending_tasks:
+                await asyncio.gather(*tuple(pending_tasks), return_exceptions=True)
+
+        async def process_response(response, sequence: int) -> None:
+            try:
+                if response.status in (401, 403, 429):
+                    response_state["http_status"] = response.status
+                if response.status != 200:
+                    return
+                try:
+                    raw_data = await response.json()
+                except Exception:
+                    return
+                data = sanitize_sensitive_data(raw_data)
+                status_code = get_business_status(data)
+                business_error = get_business_error(data)
+                if status_code == MOBILE_AUTH_STATUS:
+                    response_state["mobile_auth"] = True
+                elif business_error:
+                    response_state["last_business_error"] = business_error
+                    response_state["last_business_error_sequence"] = sequence
+
+                candidates = _find_equipment_candidates(data)
+                success = is_business_success(data) or bool(candidates)
+                if success:
+                    response_state["business_success_seen"] = True
+                    response_state["last_success_sequence"] = sequence
+                known_empty = _payload_has_known_empty_list(data)
+                if success and known_empty:
+                    response_state["explicit_empty_seen"] = True
+                if success and (candidates or known_empty) and _payload_indicates_end(data):
+                    response_state["explicit_api_end"] = True
+
+                captured_data.append(
+                    {
+                        "url": urlparse(response.url).path,
+                        "sequence": sequence,
+                        "json": data,
+                    }
+                )
+                response_state["api_response_count"] += 1
+                response_event.set()
+            except Exception:
+                return
+
+        def schedule_response(response) -> None:
+            nonlocal response_sequence
+            if not is_equipment_api(response.url):
+                return
+            response_sequence += 1
+            task = asyncio.create_task(process_response(response, response_sequence))
+            pending_tasks.add(task)
+            task.add_done_callback(pending_tasks.discard)
+
+        async def wait_for_api_activity(timeout_ms: int) -> None:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + max(0.5, timeout_ms / 1000)
+            last_sequence = response_sequence
+            last_activity_at = loop.time()
+            while loop.time() < deadline:
+                await drain_response_tasks()
+                now = loop.time()
+                if response_sequence != last_sequence:
+                    last_sequence = response_sequence
+                    last_activity_at = now
+                if response_event.is_set() and now - last_activity_at >= 0.6:
+                    break
+                await asyncio.sleep(min(0.1, max(0.0, deadline - now)))
+            await drain_response_tasks()
+
+        def response_failure() -> dict[str, Any] | None:
+            if response_state["mobile_auth"]:
+                return failure(
+                    "服务端要求手机验证，自动轮询已停止。",
+                    "mobile_verification_required",
+                    True,
+                )
+            if response_state["http_status"]:
+                status = int(response_state["http_status"])
+                return failure(
+                    f"装备接口返回 HTTP {status}，自动轮询已停止。",
+                    "rate_limited" if status == 429 else "access_denied",
+                    status in (401, 403),
+                )
+            if (
+                response_state["last_business_error"]
+                and response_state["last_business_error_sequence"]
+                > response_state["last_success_sequence"]
+            ):
+                return failure(
+                    f"装备接口返回业务错误 {response_state['last_business_error']}。",
+                    "business_error",
+                )
+            return None
+
+        page = await context.new_page()
+        page.on("response", schedule_response)
+        try:
+            print(">> [抓取] 正在访问目标装备页面...", flush=True)
+            try:
+                response_event.clear()
+                await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                await wait_for_api_activity(min(max(scroll_delay, 1500), 5000))
+            except Exception as exc:
+                return failure(f"页面加载失败: {exc}", "navigation_error")
+
+            if self._is_login_page(page.url):
+                if not (username and password):
+                    return failure(
+                        "当前 Profile 未登录，且账号池未提供有效账号密码。",
+                        "login_required",
+                        True,
+                    )
+                print(">> [登录] 检测到登录页，正在自动填写账号密码...", flush=True)
+                try:
+                    login_candidate = await self._do_login_in_page(
+                        page, context, username, password
+                    )
+                except Exception as exc:
+                    return failure(f"自动登录执行失败: {exc}", "login_required", True)
+                if not login_candidate:
+                    return failure(
+                        "自动登录未完成，可能需要验证码或手机验证。",
+                        "login_required",
+                        True,
+                    )
+
+                response_state.update(
+                    {
+                        "mobile_auth": False,
+                        "http_status": 0,
+                        "last_business_error": "",
+                        "last_business_error_sequence": -1,
+                        "last_success_sequence": -1,
+                        "business_success_seen": False,
+                        "explicit_empty_seen": False,
+                        "explicit_api_end": False,
+                        "api_response_count": 0,
+                    }
+                )
+                captured_data.clear()
+                try:
+                    response_event.clear()
+                    await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                    await wait_for_api_activity(min(max(scroll_delay, 1500), 5000))
+                except Exception as exc:
+                    return failure(f"登录后页面加载失败: {exc}", "navigation_error")
+                if self._is_login_page(page.url):
+                    return failure(
+                        "账号密码已提交，但目标页仍要求登录。",
+                        "login_required",
+                        True,
+                    )
+
+            if await self._page_requires_mobile_auth(page):
+                return failure(
+                    "页面要求手机验证，自动轮询已停止。",
+                    "mobile_verification_required",
+                    True,
+                )
+            state_failure = response_failure()
+            if state_failure:
+                return state_failure
+
+            dom_info = await self._async_extract_dom_equip_info(page)
+            observed = extract_structured_items(captured_data, dom_info.get("equip_list", []))
+            pages_scanned = 1
+            last_observed_count = len(observed)
+            no_growth_rounds = 0
+            scan_complete = bool(response_state["explicit_api_end"])
+            termination_reason = "api_end" if scan_complete else "max_rounds"
+
+            for page_number in range(2, max(1, int(max_pages)) + 1):
+                if scan_complete:
+                    break
+                response_event.clear()
+                try:
+                    await self._scroll_largest_container(page)
+                except Exception as exc:
+                    termination_reason = f"scroll_error:{type(exc).__name__}"
+                    break
+                await wait_for_api_activity(max(1000, int(scroll_delay)))
+                pages_scanned = page_number
+
+                if await self._page_requires_mobile_auth(page):
+                    return failure(
+                        "滚动期间页面要求手机验证，自动轮询已停止。",
+                        "mobile_verification_required",
+                        True,
+                    )
+                state_failure = response_failure()
+                if state_failure:
+                    return state_failure
+
+                dom_info = await self._async_extract_dom_equip_info(page)
+                observed = extract_structured_items(captured_data, dom_info.get("equip_list", []))
+                current_count = len(observed)
+                changes = count_equipment_changes(known_items or [], observed)
+                if current_count > last_observed_count:
+                    no_growth_rounds = 0
+                else:
+                    no_growth_rounds += 1
+                last_observed_count = current_count
+
+                print(
+                    f"   └─ 第 {pages_scanned} 轮：观察 {current_count} 条，"
+                    f"新增/更新 {changes} 条，无新增观察 "
+                    f"{no_growth_rounds}/{max(1, idle_rounds)}",
+                    flush=True,
+                )
+                if response_state["explicit_api_end"]:
+                    scan_complete = True
+                    termination_reason = "api_end"
+                    break
+                if await self._page_has_explicit_end_marker(page):
+                    scan_complete = True
+                    termination_reason = "dom_end"
+                    break
+                if no_growth_rounds >= max(1, int(idle_rounds)):
+                    termination_reason = "idle"
+                    break
+
+            await drain_response_tasks()
+            dom_info = await self._async_extract_dom_equip_info(page)
+            observed = extract_structured_items(captured_data, dom_info.get("equip_list", []))
+
+            if not observed and not (
+                response_state["business_success_seen"] and response_state["explicit_empty_seen"]
+            ):
+                result = failure(
+                    "页面已打开，但没有解析到有效装备数据。",
+                    "data_unavailable",
+                )
+                result.update(
+                    {
+                        "api_diagnostics": summarize_api_payloads(captured_data),
+                        "captured_api_count": len(captured_data),
+                        "pages_scanned": pages_scanned,
+                        "termination_reason": termination_reason,
+                    }
+                )
+                return result
+
+            changes_detected = count_equipment_changes(known_items or [], observed)
+            return {
+                "success": True,
+                "auth_state": "authenticated",
+                "needs_user_action": False,
+                "refer_sn": params.get("refer_sn", ""),
+                "params": params,
+                "captured_apis": captured_data,
+                "captured_api_count": len(captured_data),
+                "equip_list": observed,
+                "observed_equip_list": observed,
+                "changes_detected": changes_detected,
+                "title": dom_info.get("title", ""),
+                "raw_dom": dom_info.get("raw_dom", {}),
+                "pages_scanned": pages_scanned,
+                "scan_complete": scan_complete,
+                "termination_reason": termination_reason,
+                "fallback_identity_count": sum(
+                    1 for item in observed if not item.get("identity_stable")
+                ),
+            }
+        finally:
+            page.remove_listener("response", schedule_response)
+            await drain_response_tasks()
+            await page.close()
+
+    @staticmethod
+    async def _scroll_largest_container(page) -> dict[str, Any]:
+        return await page.evaluate(
+            """() => {
+                const root = document.scrollingElement || document.documentElement;
+                const candidates = [root, ...document.querySelectorAll('body *')]
+                    .filter((element, index, all) => all.indexOf(element) === index)
+                    .filter(element => {
+                        if (!element) return false;
+                        const style = getComputedStyle(element);
+                        const overflow = style.overflowY;
+                        return element.scrollHeight > element.clientHeight + 16 &&
+                            (element === root || overflow === 'auto' || overflow === 'scroll');
+                    })
+                    .sort((a, b) =>
+                        (b.scrollHeight - b.clientHeight) -
+                        (a.scrollHeight - a.clientHeight));
+                const target = candidates[0] || root;
+                const before = target === root ? window.scrollY : target.scrollTop;
+                if (target === root) {
+                    window.scrollTo({top: root.scrollHeight, behavior: 'auto'});
+                } else {
+                    target.scrollTop = target.scrollHeight;
+                }
+                const after = target === root ? window.scrollY : target.scrollTop;
+                return {
+                    moved: after > before,
+                    before,
+                    after,
+                    scrollHeight: target.scrollHeight,
+                    clientHeight: target.clientHeight
+                };
+            }"""
+        )
+
+    @staticmethod
+    def _is_login_page(url: str) -> bool:
+        lowered = url.lower()
+        return "show_login" in lowered or "/login" in lowered
+
+    @staticmethod
+    async def _page_requires_mobile_auth(page) -> bool:
+        lowered = page.url.lower()
+        if "verify" in lowered or "uphone" in lowered:
+            return True
+        try:
+            body = await page.locator("body").inner_text(timeout=1500)
+        except Exception:
+            return False
+        return "验证手机" in body and "获取验证码" in body
+
+    @staticmethod
+    async def _page_has_explicit_end_marker(page) -> bool:
+        try:
+            body = await page.locator("body").inner_text(timeout=1200)
+        except Exception:
+            return False
+        tail = body[-800:]
+        return any(
+            marker in tail for marker in ("没有更多了", "已加载全部", "已经到底了", "暂无更多")
+        )
+
+    async def _async_extract_dom_equip_info(self, page) -> dict[str, Any]:
+        try:
+            title = await page.title()
+            items = await page.evaluate(
+                """() => {
+                    const results = [];
+                    const cards = document.querySelectorAll(
+                        '.equip_item, .equip-card, .equip-list-item, [data-equip-id]'
+                    );
+                    cards.forEach(card => {
+                        results.push({
+                            equip_id: card.dataset?.equipId || '',
+                            name: card.querySelector('.name, .title')?.innerText || '',
+                            price: card.querySelector('.price, .amount')?.innerText || '',
+                            desc: card.innerText || ''
+                        });
+                    });
+                    return results;
+                }"""
+            )
+            return {
+                "title": title,
+                "equip_list": items,
+                "raw_dom": {"item_count": len(items)},
+            }
+        except Exception:
+            return {"title": "", "equip_list": [], "raw_dom": {}}
+
+
+def format_equip_list(equip_data: dict[str, Any]) -> str:
+    lines = ["===== 网易阴阳师藏宝阁装备数据 ====="]
+    lines.append(f"状态: {'成功' if equip_data.get('success') else '失败'}")
+    if equip_data.get("auth_state"):
+        lines.append(f"认证状态: {equip_data['auth_state']}")
+    if equip_data.get("scan_mode"):
+        lines.append(
+            "扫描模式: " + ("深度扫描" if equip_data["scan_mode"] == "full" else "增量扫描")
+        )
+    if not equip_data.get("success"):
+        lines.append(f"错误信息: {equip_data.get('error', '无')}")
+        if equip_data.get("captured_api_count") is not None:
+            lines.append(f"捕获装备接口响应: {equip_data['captured_api_count']} 个")
+        for diagnostic in equip_data.get("api_diagnostics", []):
+            keys = ",".join(diagnostic.get("top_keys", [])) or "-"
+            lists = ",".join(diagnostic.get("list_paths", [])) or "-"
+            lines.append(
+                f"接口结构: {diagnostic.get('endpoint')} | "
+                f"status={diagnostic.get('status_code') or '-'} | "
+                f"keys={keys} | lists={lists}"
+            )
+        if equip_data.get("needs_user_action"):
+            lines.append("处理方式: 使用当前账号运行 python interactive_browser.py")
+        return "\n".join(lines)
+
+    lines.append(f"持久快照项目: {len(equip_data.get('equip_list', []))} 个")
+    if equip_data.get("incremental_item_count") is not None:
+        lines.append(f"本轮观察项目: {equip_data['incremental_item_count']} 个")
+    if equip_data.get("changes_detected") is not None:
+        lines.append(f"本轮新增/更新: {equip_data['changes_detected']} 个")
+    stats = equip_data.get("storage_stats") or {}
+    if stats:
+        lines.append(
+            f"数据库写入: 新增 {stats.get('inserted', 0)} / "
+            f"更新 {stats.get('updated', 0)} / 未变化 {stats.get('unchanged', 0)}"
+        )
+    if equip_data.get("pages_scanned"):
+        lines.append(
+            f"滚动轮数: {equip_data['pages_scanned']} | "
+            f"结束原因: {equip_data.get('termination_reason', '-')}"
+        )
+    if equip_data.get("snapshot_may_include_stale"):
+        lines.append("快照提示: 按不删除策略保留历史项目，请结合 last_seen_at 判断新旧。")
+
+    preview = equip_data.get("equip_list", [])[:20]
+    for index, item in enumerate(preview, 1):
+        lines.append(
+            f"  [{index}] {item.get('name') or '未命名'} | "
+            f"价格: {item.get('price') or '暂无'} | ID: {item.get('id') or '-'}"
+        )
+    remaining = len(equip_data.get("equip_list", [])) - len(preview)
+    if remaining > 0:
+        lines.append(f"  ……其余 {remaining} 项请查看预览页或导出文件")
+    return "\n".join(lines)

@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>藏宝阁数据预览</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow"><span class="status-dot"></span> SQLite 实时快照</p>
+        <h1>藏宝阁数据预览</h1>
+        <p class="subtitle">查看累计项目、最近变更与每轮采集状态。项目只更新或新增，不自动删除。</p>
+      </div>
+      <button id="refreshButton" class="button primary" type="button">刷新数据</button>
+    </header>
+
+    <section class="toolbar panel" aria-label="筛选条件">
+      <label>
+        <span>账号与目标</span>
+        <select id="scopeSelect">
+          <option value="">全部范围</option>
+        </select>
+      </label>
+      <label class="search-field">
+        <span>搜索</span>
+        <input id="searchInput" type="search" placeholder="名称、ID 或唯一键" autocomplete="off">
+      </label>
+      <label>
+        <span>排序</span>
+        <select id="sortSelect">
+          <option value="last_changed_at:desc">最近变化</option>
+          <option value="last_seen_at:desc">最近观察</option>
+          <option value="first_seen_at:desc">最近新增</option>
+          <option value="name:asc">名称 A–Z</option>
+          <option value="seen_count:desc">观察次数</option>
+        </select>
+      </label>
+    </section>
+
+    <section class="stats" aria-label="数据概览">
+      <article class="stat-card">
+        <span>累计项目</span>
+        <strong id="totalStat">—</strong>
+        <small>不执行删除</small>
+      </article>
+      <article class="stat-card">
+        <span>稳定 ID</span>
+        <strong id="stableStat">—</strong>
+        <small id="fallbackStat">降级键 —</small>
+      </article>
+      <article class="stat-card">
+        <span>24 小时变化</span>
+        <strong id="changedStat">—</strong>
+        <small>新增或内容更新</small>
+      </article>
+      <article class="stat-card accent">
+        <span>最近采集</span>
+        <strong id="runStateStat">—</strong>
+        <small id="latestSeenStat">等待数据</small>
+      </article>
+    </section>
+
+    <section class="panel data-panel">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">LISTINGS</p>
+          <h2>项目快照</h2>
+        </div>
+        <span id="resultCount" class="pill">0 条</span>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>项目</th>
+              <th>价格</th>
+              <th>等级</th>
+              <th>来源</th>
+              <th>首次发现</th>
+              <th>最近观察</th>
+              <th>变化时间</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="itemsBody"></tbody>
+        </table>
+        <div id="emptyState" class="empty-state" hidden>
+          <strong>暂无匹配数据</strong>
+          <span>先运行采集程序，或调整当前筛选条件。</span>
+        </div>
+      </div>
+
+      <nav class="pagination" aria-label="分页">
+        <button id="previousButton" class="button ghost" type="button">上一页</button>
+        <span id="pageLabel">第 1 页</span>
+        <button id="nextButton" class="button ghost" type="button">下一页</button>
+      </nav>
+    </section>
+
+    <section class="panel runs-panel">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">SCAN HISTORY</p>
+          <h2>最近采集</h2>
+        </div>
+      </div>
+      <div id="runsList" class="runs-list"></div>
+    </section>
+  </main>
+
+  <dialog id="detailDialog">
+    <div class="dialog-head">
+      <div>
+        <p class="eyebrow">DETAIL</p>
+        <h2 id="dialogTitle">项目详情</h2>
+      </div>
+      <button id="closeDialogButton" class="icon-button" type="button" aria-label="关闭">×</button>
+    </div>
+    <dl id="detailMeta" class="detail-meta"></dl>
+    <pre id="detailJson"></pre>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>
