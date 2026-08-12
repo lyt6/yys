@@ -57,6 +57,9 @@ EQUIPMENT_CONTAINER_KEYS = {
 WRAPPER_KEYS = {"data", "result"}
 LOGIN_AGREEMENT_CHECKBOX_SELECTOR = ", ".join(
     (
+        '.fur-agree-4 input[type="checkbox"]',
+        '.u-zc-agree input[type="checkbox"]',
+        'input.zc-un-login[type="checkbox"]',
         '.m-mail-clause input[type="checkbox"]',
         '.fur-agree input[type="checkbox"]',
         '.j-mail-clause-span input[type="checkbox"]',

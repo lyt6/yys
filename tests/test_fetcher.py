@@ -94,6 +94,18 @@ class FakeAgreementFrame:
         return self.collections.get(selector, FakeLocatorCollection())
 
 
+class CurrentNetEaseAgreementFrame:
+    """Minimal model of the public 163 login DOM observed on 2026-08-12."""
+
+    def __init__(self, checkbox):
+        self.checkbox = checkbox
+
+    def locator(self, selector):
+        if '.fur-agree-4 input[type="checkbox"]' in selector:
+            return FakeLocatorCollection([self.checkbox])
+        return FakeLocatorCollection()
+
+
 def test_relative_profile_path_is_not_based_on_process_cwd(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     fetcher = CBGFetcher(user_data_dir="browser_profiles/one")
@@ -228,6 +240,13 @@ def test_login_agreement_checks_all_matching_native_inputs():
     assert first.checked is True
     assert second.checked is True
     assert first.check_count == second.check_count == 1
+
+
+def test_login_agreement_covers_current_netease_sibling_checkbox_dom():
+    checkbox = FakeAgreementElement(native=True)
+    frame = CurrentNetEaseAgreementFrame(checkbox)
+    assert asyncio.run(CBGFetcher()._ensure_login_agreement(frame)) is True
+    assert checkbox.checked is True
 
 
 def test_login_agreement_skips_hidden_first_control_and_clicks_visible_one():
