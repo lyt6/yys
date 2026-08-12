@@ -55,6 +55,7 @@ EQUIPMENT_CONTAINER_KEYS = {
     "selling_list",
 }
 WRAPPER_KEYS = {"data", "result"}
+PAGINATION_WRAPPER_KEYS = {"pager", "paging"}
 LOGIN_AGREEMENT_CHECKBOX_SELECTOR = ", ".join(
     (
         '.fur-agree-4 input[type="checkbox"]',
@@ -167,11 +168,41 @@ def _run_async(coro):
 def _looks_like_equipment(value: dict[str, Any]) -> bool:
     has_id = any(
         value.get(key) not in (None, "")
-        for key in ("equip_id", "listing_id", "ordersn", "order_sn", "id", "sn")
+        for key in (
+            "eid",
+            "game_ordersn",
+            "equip_sn",
+            "item_sn",
+            "equipid",
+            "equip_id",
+            "listing_id",
+            "ordersn",
+            "order_sn",
+            "id",
+            "sn",
+        )
     )
-    has_name = any(value.get(key) not in (None, "") for key in ("equip_name", "name", "title"))
+    has_name = any(
+        value.get(key) not in (None, "")
+        for key in (
+            "desc_sumup_short",
+            "format_equip_name",
+            "equip_name",
+            "name",
+            "title",
+        )
+    )
     has_listing_field = any(
-        key in value for key in ("price", "price_desc", "level", "equip_level", "equip_desc")
+        key in value
+        for key in (
+            "price",
+            "price_total",
+            "price_desc",
+            "level",
+            "equip_level",
+            "equip_desc",
+            "other_info",
+        )
     )
     return (has_id and (has_name or has_listing_field)) or (has_name and has_listing_field)
 
@@ -242,7 +273,7 @@ def _payload_indicates_end(data: Any) -> bool:
     if not isinstance(data, dict):
         return False
     false_means_end = {"has_more", "has_next", "has_next_page", "more"}
-    true_means_end = {"is_end", "is_last", "last_page", "no_more"}
+    true_means_end = {"is_end", "is_last", "is_last_page", "last_page", "no_more"}
 
     def visit(value: Any, depth: int = 0) -> bool:
         if depth > 7 or not isinstance(value, dict):
@@ -253,7 +284,9 @@ def _payload_indicates_end(data: Any) -> bool:
                 return True
             if normalized in true_means_end and child is True:
                 return True
-            if normalized in WRAPPER_KEYS and visit(child, depth + 1):
+            if normalized in WRAPPER_KEYS | PAGINATION_WRAPPER_KEYS and visit(
+                child, depth + 1
+            ):
                 return True
         return False
 

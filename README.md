@@ -53,16 +53,17 @@
 
 唯一键按以下优先级获取：
 
-1. `equip_id`
-2. `listing_id`
-3. `ordersn` / `order_sn`
-4. `id`
-5. `sn`
-6. `role_id` / `roleid`
+1. 当前推荐接口的 `eid`
+2. `serverid/server_id + game_ordersn/equip_sn/item_sn` 组合键
+3. `game_ordersn` / `equip_sn` / `item_sn` / `equipid` 等单字段后备键
+4. `equip_id` / `listing_id` / `ordersn` / `order_sn`
+5. `id` / `sn` / `role_id` / `roleid`
 
 没有任何稳定 ID 时，使用“名称 + 等级”的哈希降级键，并以 `identity_stable=false` 明确标记。这类记录无法可靠区分同名同等级项目，预览页会显示“降级键”。
 
-内容哈希比较名称、价格、等级和详情，并忽略请求 ID、跟踪 ID、服务端时间、推荐排名、浏览次数等请求级或统计级字段。价格或实际详情变化仍会计为更新。
+当前 `/cgi-bin/recommend.py` 的 `result[]` 会解析 `game_ordersn`、`equipid`、`desc_sumup_short`、`format_equip_name` 和 `other_info` 等字段；接口价格以分返回，列表及 SQLite 的 `price` 转成元并保留两位小数，原始分值仍保存在 `detail_json`。其他接口的价格单位保持原样。
+
+内容哈希比较名称、价格、等级和详情，并忽略请求 ID、跟踪 ID、服务端时间、推荐排名、页内位置和活动倒计时等请求级字段。价格、基础属性或亮点等实际详情变化仍会计为更新。
 
 每条记录保存：
 
@@ -83,7 +84,7 @@
 - 深度扫描默认每 3600 秒执行一次，最多滚动 100 轮。
 - 每轮滚动后按“本轮累计观察到的唯一 ID 数量”判断是否加载了下一批数据。
 - 连续 3 轮没有观察到更多唯一 ID 时，以 `termination_reason=idle` 停止，但不会宣称已经扫描到底。
-- 只有接口明确返回 `has_more=false`、`is_end=true` 等字段，或页面出现明确的“没有更多”标记时，`scan_complete=true`。
+- 只有接口明确返回 `has_more=false`、`is_end=true`、`paging.is_last_page=true` 等字段，或页面出现明确的“没有更多”标记时，`scan_complete=true`。
 
 这能覆盖“前几页都是已知项目、较深位置才有批量更新”的情况，因为停止条件不再使用“相对于旧快照的变更数”。
 

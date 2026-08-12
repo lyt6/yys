@@ -5,9 +5,15 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterable
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 ID_FIELDS = (
+    "eid",
+    "game_ordersn",
+    "equip_sn",
+    "item_sn",
+    "equipid",
     "equip_id",
     "listing_id",
     "ordersn",
@@ -57,8 +63,11 @@ VOLATILE_KEYS = {
     "request_id",
     "request_time",
     "recommend_score",
+    "reco_request_id",
     "rank",
     "position",
+    "page_index",
+    "expire_remain_seconds",
     "view_count",
     "click_count",
     "collect_count",
@@ -101,15 +110,48 @@ def _scalar_text(value: Any) -> str:
     return str(value).strip()
 
 
+def _display_price(value: Any, source: str) -> str:
+    """Convert the known recommend endpoint's cent price while retaining raw detail."""
+    text = _scalar_text(value)
+    if not text or "/cgi-bin/recommend.py" not in str(source).lower():
+        return text
+    try:
+        return f"{Decimal(text) / Decimal(100):.2f}"
+    except InvalidOperation:
+        return text
+
+
 def extract_raw_identity(raw: dict[str, Any]) -> tuple[str, str, str, bool]:
     """Return canonical identity, display ID, ID kind and stability."""
+    eid = _scalar_text(raw.get("eid"))
+    if eid:
+        return f"eid:{eid}", eid, "eid", True
+
+    server_id = _scalar_text(raw.get("serverid") or raw.get("server_id"))
+    for key in ("game_ordersn", "equip_sn", "item_sn"):
+        serial = _scalar_text(raw.get(key))
+        if server_id and serial:
+            value = f"{server_id}:{serial}"
+            return f"server_serial:{value}", value, "server_serial", True
+
     for key in ID_FIELDS:
+        if key == "eid":
+            continue
         value = _scalar_text(raw.get(key))
         if value:
             normalized_key = "ordersn" if key == "order_sn" else key
             return f"{normalized_key}:{value}", value, normalized_key, True
 
-    name = _scalar_text(raw.get("equip_name") or raw.get("name") or raw.get("title"))
+    other_info = raw.get("other_info")
+    nested = other_info if isinstance(other_info, dict) else {}
+    name = _scalar_text(
+        raw.get("desc_sumup_short")
+        or nested.get("format_equip_name")
+        or raw.get("format_equip_name")
+        or raw.get("equip_name")
+        or raw.get("name")
+        or raw.get("title")
+    )
     level = _scalar_text(raw.get("level") or raw.get("equip_level"))
     basis = f"{name}\x1f{level}"
     if not name:
@@ -131,11 +173,27 @@ def normalize_equipment_item(
 ) -> dict[str, Any]:
     clean_raw = sanitize_sensitive_data(raw)
     identity, display_id, id_kind, stable = extract_raw_identity(clean_raw)
+    other_info = clean_raw.get("other_info")
+    nested = other_info if isinstance(other_info, dict) else {}
     name = _scalar_text(
-        clean_raw.get("equip_name") or clean_raw.get("name") or clean_raw.get("title")
+        clean_raw.get("desc_sumup_short")
+        or nested.get("format_equip_name")
+        or clean_raw.get("format_equip_name")
+        or clean_raw.get("equip_name")
+        or clean_raw.get("name")
+        or clean_raw.get("title")
     )
-    price = _scalar_text(clean_raw.get("price") or clean_raw.get("price_desc"))
-    level = _scalar_text(clean_raw.get("level") or clean_raw.get("equip_level"))
+    raw_price = (
+        clean_raw.get("price_total")
+        if clean_raw.get("price_total") not in (None, "")
+        else clean_raw.get("price") or clean_raw.get("price_desc")
+    )
+    price = _display_price(raw_price, source)
+    level = _scalar_text(
+        clean_raw.get("level")
+        or clean_raw.get("equip_level")
+        or nested.get("level_desc")
+    )
     item = {
         "identity": identity,
         "identity_stable": stable,

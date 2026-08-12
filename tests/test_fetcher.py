@@ -261,6 +261,8 @@ def test_business_status_handles_explicit_failure_without_status_code():
 def test_explicit_pagination_end_requires_known_fields():
     assert _payload_indicates_end({"result": {"has_more": False}})
     assert _payload_indicates_end({"data": {"is_end": True}})
+    assert _payload_indicates_end({"paging": {"is_last_page": True}})
+    assert _payload_indicates_end({"pager": {"has_next_page": False}})
     assert not _payload_indicates_end({"has_more": True})
     assert not _payload_indicates_end({"complete": True})
 
@@ -317,6 +319,102 @@ def test_common_data_list_wrapper_is_parsed():
         [],
     )
     assert [item["id"] for item in items] == ["A"]
+
+
+def test_current_recommend_result_items_are_parsed():
+    items = extract_structured_items(
+        [
+            {
+                "sequence": 1,
+                "url": "/cgi-bin/recommend.py",
+                "json": {
+                    "status": "OK",
+                    "status_code": "OK",
+                    "paging": {"is_last_page": True},
+                    "result": [
+                        {
+                            "serverid": "server-a",
+                            "game_ordersn": "order-a",
+                            "equipid": "equip-a",
+                            "desc_sumup_short": "账号摘要",
+                            "format_equip_name": "角色名",
+                            "price": 18800,
+                            "other_info": {
+                                "level_desc": "60级",
+                                "basic_attrs": [],
+                                "highlights": [],
+                            },
+                        }
+                    ],
+                },
+            }
+        ],
+        [],
+    )
+
+    assert len(items) == 1
+    assert items[0]["identity"] == "server_serial:server-a:order-a"
+    assert items[0]["id"] == "server-a:order-a"
+    assert items[0]["id_kind"] == "server_serial"
+    assert items[0]["name"] == "账号摘要"
+    assert items[0]["price"] == "188.00"
+    assert items[0]["detail"]["price"] == 18800
+    assert items[0]["level"] == "60级"
+
+
+def test_recommend_items_with_same_order_on_different_servers_remain_distinct():
+    payload = {
+        "status_code": "OK",
+        "result": [
+            {
+                "serverid": server,
+                "game_ordersn": "same-order",
+                "price": 100,
+                "other_info": {"format_equip_name": f"角色-{server}"},
+            }
+            for server in ("server-a", "server-b")
+        ],
+    }
+    items = extract_structured_items(
+        [{"sequence": 1, "url": "/cgi-bin/recommend.py", "json": payload}],
+        [],
+    )
+
+    assert {item["identity"] for item in items} == {
+        "server_serial:server-a:same-order",
+        "server_serial:server-b:same-order",
+    }
+
+
+def test_recommend_eid_is_preferred_and_nested_name_is_supported():
+    items = extract_structured_items(
+        [
+            {
+                "sequence": 1,
+                "url": "/cgi-bin/recommend.py",
+                "json": {
+                    "status_code": "OK",
+                    "result": [
+                        {
+                            "eid": "stable-eid",
+                            "serverid": "server-a",
+                            "equip_sn": "equip-serial",
+                            "price_total": 9900,
+                            "other_info": {
+                                "format_equip_name": "嵌套角色名",
+                                "level_desc": "55级",
+                            },
+                        }
+                    ],
+                },
+            }
+        ],
+        [],
+    )
+
+    assert items[0]["identity"] == "eid:stable-eid"
+    assert items[0]["name"] == "嵌套角色名"
+    assert items[0]["price"] == "99.00"
 
 
 def test_sync_wrapper_rejects_nested_event_loop_cleanly():

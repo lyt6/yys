@@ -121,6 +121,53 @@ def test_volatile_fields_do_not_trigger_change_but_price_does():
     assert count_equipment_changes([first], [changed]) == 1
 
 
+def test_recommend_request_and_countdown_fields_are_not_semantic_changes():
+    first = normalize_equipment_item(
+        {
+            "serverid": "server-a",
+            "game_ordersn": "order-a",
+            "price": 100,
+            "reco_request_id": "request-one",
+            "page_index": 1,
+            "price_explanation": {"expire_remain_seconds": 60},
+        },
+        source="api",
+    )
+    later = normalize_equipment_item(
+        {
+            "serverid": "server-a",
+            "game_ordersn": "order-a",
+            "price": 100,
+            "reco_request_id": "request-two",
+            "page_index": 9,
+            "price_explanation": {"expire_remain_seconds": 30},
+        },
+        source="api",
+    )
+
+    assert equipment_fingerprint(first) == equipment_fingerprint(later)
+    assert count_equipment_changes([first], [later]) == 0
+
+
+def test_recommend_price_is_displayed_in_yuan_but_raw_detail_keeps_cents():
+    item = normalize_equipment_item(
+        {"game_ordersn": "order-a", "price": 18800},
+        source="/cgi-bin/recommend.py",
+    )
+
+    assert item["price"] == "188.00"
+    assert item["detail"]["price"] == 18800
+
+
+def test_non_recommend_price_keeps_existing_units():
+    item = normalize_equipment_item(
+        {"equip_id": "equip-a", "price": 18800},
+        source="/cgi-bin/query.py",
+    )
+
+    assert item["price"] == "18800"
+
+
 def test_fallback_identity_is_explicitly_marked_unstable():
     item = normalize_equipment_item({"name": "没有业务 ID", "level": 15, "price": 10}, source="dom")
     assert item["identity"].startswith("display:")
