@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sqlite3
 from typing import Any
 
 from playwright.async_api import async_playwright
@@ -19,11 +20,13 @@ from cbg_fetcher import (
 from data_model import sanitize_sensitive_data
 from main import (
     DEFAULT_TARGET_URL,
+    account_database_path,
+    account_profile_path,
     load_account_configuration,
     select_account,
     validate_target_url,
 )
-from storage import InstanceLock, safe_account_key, target_key_for_url
+from storage import InstanceLock, SQLiteStore, safe_account_key, target_key_for_url
 
 
 async def run_interactive() -> bool:
@@ -32,10 +35,12 @@ async def run_interactive() -> bool:
     target_url = validate_target_url(
         str(account.get("target_url") or os.getenv("CBG_TARGET_URL", DEFAULT_TARGET_URL))
     )
-    profile_dir = str(account["profile_dir"])
+    profile_dir = account_profile_path(account)
+    database_path = account_database_path(account)
     account_key = safe_account_key(str(account.get("name") or active_index))
+    target_key = target_key_for_url(target_url)
     lock_path = os.path.join(
-        "data", ".locks", f"{account_key}-{target_key_for_url(target_url)}.lock"
+        "data", ".locks", f"{account_key}-{target_key}.lock"
     )
     fetcher = CBGFetcher(user_data_dir=profile_dir)
     response_state: dict[str, Any] = {
@@ -48,15 +53,15 @@ async def run_interactive() -> bool:
     print("网易藏宝阁交互式会话验证", flush=True)
     print(f"账号: {account_key}", flush=True)
     print(f"Profile: {profile_dir}", flush=True)
+    print(f"SQLite: {database_path}", flush=True)
     print("请在浏览器窗口中完成登录、短信或滑块验证。", flush=True)
     print("=" * 64, flush=True)
 
     with InstanceLock(lock_path):
+        store = SQLiteStore(database_path)
         async with async_playwright() as playwright:
             os.makedirs(fetcher.user_data_dir, exist_ok=True)
-            context = await playwright.chromium.launch_persistent_context(
-                **fetcher._persistent_context_options(headless=False)
-            )
+            context = await fetcher._launch_persistent_context(playwright, headless=False)
             try:
                 page = context.pages[0] if context.pages else await context.new_page()
                 pending: set[asyncio.Task] = set()
@@ -125,6 +130,12 @@ async def run_interactive() -> bool:
                             print(
                                 ">> [成功] 装备接口已正常返回，Profile 可以用于抓取。", flush=True
                             )
+                            await asyncio.to_thread(
+                                store.record_manual_verification,
+                                account_key,
+                                target_key,
+                                target_url,
+                            )
                             return True
                         if response_state["http_status"]:
                             print(
@@ -149,13 +160,13 @@ async def run_interactive() -> bool:
                     page.remove_listener("response", schedule_response)
                     await drain()
             finally:
-                await context.close()
+                await fetcher._close_context(context)
 
 
 def main() -> int:
     try:
         return 0 if asyncio.run(run_interactive()) else 1
-    except (RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
         print(f"[无法启动] {exc}", flush=True)
         return 1
 

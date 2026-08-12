@@ -142,6 +142,7 @@ tbody tr:hover { background: rgba(78, 216, 199, 0.035); }
 .run-row:last-child { border-bottom: 0; }
 .run-row strong { color: var(--text); }
 .state-badge.success { color: var(--cyan); }
+.state-badge.running { color: var(--amber); }
 .state-badge.failure { color: var(--danger); }
 .run-error { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 

@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import csv
 import inspect
 import json
 import os
-import tempfile
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -305,120 +304,6 @@ def summarize_api_payloads(
     return summaries
 
 
-def _atomic_json_write(value: Any, filepath: str) -> None:
-    directory = os.path.abspath(os.path.dirname(filepath) or ".")
-    os.makedirs(directory, exist_ok=True)
-    temp_path = ""
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=directory,
-            prefix=f".{os.path.basename(filepath)}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temp_path = handle.name
-            json.dump(value, handle, ensure_ascii=False, indent=2)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, filepath)
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
-
-
-def export_to_json(equip_data: dict[str, Any], filepath: str = "equip_data.json") -> str:
-    exportable = {
-        key: equip_data[key]
-        for key in (
-            "success",
-            "error",
-            "auth_state",
-            "needs_user_action",
-            "refer_sn",
-            "params",
-            "title",
-            "equip_list",
-            "cycle",
-            "started_at",
-            "fetched_at",
-            "pages_scanned",
-            "scan_complete",
-            "termination_reason",
-            "scan_mode",
-            "incremental_item_count",
-            "snapshot_item_count",
-            "changes_detected",
-            "full_refreshed_at",
-            "snapshot_may_include_stale",
-            "storage_stats",
-            "database_path",
-        )
-        if key in equip_data
-    }
-    _atomic_json_write(sanitize_sensitive_data(exportable), filepath)
-    return filepath
-
-
-def export_to_csv(equip_data: dict[str, Any], filepath: str = "equip_data.csv") -> str:
-    directory = os.path.abspath(os.path.dirname(filepath) or ".")
-    os.makedirs(directory, exist_ok=True)
-    fieldnames = [
-        "identity",
-        "id",
-        "id_kind",
-        "name",
-        "price",
-        "level",
-        "source",
-        "first_seen_at",
-        "last_seen_at",
-        "last_changed_at",
-        "seen_count",
-        "desc",
-    ]
-    temp_path = ""
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8-sig",
-            newline="",
-            dir=directory,
-            prefix=f".{os.path.basename(filepath)}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temp_path = handle.name
-            writer = csv.DictWriter(handle, fieldnames=fieldnames)
-            writer.writeheader()
-            for item in equip_data.get("equip_list", []):
-                detail = sanitize_sensitive_data(item.get("detail", {}))
-                writer.writerow(
-                    {
-                        "identity": item.get("identity", ""),
-                        "id": item.get("id", ""),
-                        "id_kind": item.get("id_kind", ""),
-                        "name": item.get("name", ""),
-                        "price": item.get("price", ""),
-                        "level": item.get("level", ""),
-                        "source": item.get("source", ""),
-                        "first_seen_at": item.get("first_seen_at", ""),
-                        "last_seen_at": item.get("last_seen_at", ""),
-                        "last_changed_at": item.get("last_changed_at", ""),
-                        "seen_count": item.get("seen_count", ""),
-                        "desc": json.dumps(detail, ensure_ascii=False, default=str),
-                    }
-                )
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, filepath)
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
-    return filepath
-
-
 class CBGFetcher:
     BASE_LOGIN_URL = "https://yys.cbg.163.com/cgi/mweb/show_login"
 
@@ -426,14 +311,36 @@ class CBGFetcher:
         self,
         user_data_dir: str = "./browser_profile_stable",
         browser_channel: str | None = None,
+        browser_start_attempts: int | None = None,
+        browser_retry_delay_seconds: int | None = None,
     ) -> None:
-        self.user_data_dir = user_data_dir
+        profile_path = Path(user_data_dir)
+        if not profile_path.is_absolute():
+            profile_path = Path(__file__).resolve().parent / profile_path
+        self.user_data_dir = str(profile_path.resolve())
         configured = (
             browser_channel
             if browser_channel is not None
             else os.getenv("CBG_BROWSER_CHANNEL", "chrome")
         )
         self.browser_channel = configured.strip() or None
+        self.browser_start_attempts = self._positive_setting(
+            browser_start_attempts,
+            os.getenv("CBG_BROWSER_START_ATTEMPTS"),
+            default=3,
+        )
+        self.browser_retry_delay_seconds = self._positive_setting(
+            browser_retry_delay_seconds,
+            os.getenv("CBG_BROWSER_RETRY_DELAY_SECONDS"),
+            default=3,
+        )
+
+    @staticmethod
+    def _positive_setting(explicit: int | None, environment: str | None, default: int) -> int:
+        try:
+            return max(1, int(explicit if explicit is not None else environment or default))
+        except (TypeError, ValueError):
+            return default
 
     def _persistent_context_options(self, headless: bool) -> dict[str, Any]:
         options: dict[str, Any] = {
@@ -443,6 +350,35 @@ class CBGFetcher:
         if self.browser_channel:
             options["channel"] = self.browser_channel
         return options
+
+    async def _launch_persistent_context(self, playwright, headless: bool):
+        """Retry transient Profile/Chrome startup failures without killing other processes."""
+        last_error: Exception | None = None
+        for attempt in range(1, self.browser_start_attempts + 1):
+            try:
+                return await playwright.chromium.launch_persistent_context(
+                    **self._persistent_context_options(headless)
+                )
+            except Exception as exc:
+                last_error = exc
+                if attempt >= self.browser_start_attempts:
+                    break
+                delay = self.browser_retry_delay_seconds * attempt
+                print(
+                    f">> [浏览器] 启动失败（{attempt}/{self.browser_start_attempts}），"
+                    f"{delay} 秒后重试: {exc}",
+                    flush=True,
+                )
+                await asyncio.sleep(delay)
+        assert last_error is not None
+        raise last_error
+
+    @staticmethod
+    async def _close_context(context) -> None:
+        try:
+            await context.close()
+        except Exception as exc:
+            print(f">> [浏览器] 关闭会话时出现警告: {exc}", flush=True)
 
     def login(
         self,
@@ -464,14 +400,12 @@ class CBGFetcher:
             raise RuntimeError("Playwright 未安装")
         async with async_playwright() as playwright:
             os.makedirs(self.user_data_dir, exist_ok=True)
-            context = await playwright.chromium.launch_persistent_context(
-                **self._persistent_context_options(headless)
-            )
+            context = await self._launch_persistent_context(playwright, headless)
             try:
                 page = context.pages[0] if context.pages else await context.new_page()
                 return await self._do_login_in_page(page, context, username, password, timeout)
             finally:
-                await context.close()
+                await self._close_context(context)
 
     async def _do_login_in_page(
         self,
@@ -595,9 +529,7 @@ class CBGFetcher:
         async with async_playwright() as playwright:
             os.makedirs(self.user_data_dir, exist_ok=True)
             try:
-                context = await playwright.chromium.launch_persistent_context(
-                    **self._persistent_context_options(headless)
-                )
+                context = await self._launch_persistent_context(playwright, headless)
             except Exception as exc:
                 return self._failure_result(url, f"浏览器启动失败: {exc}", "browser_unavailable")
             try:
@@ -605,7 +537,7 @@ class CBGFetcher:
                     context, url, username, password, max_pages, scroll_delay, idle_rounds, []
                 )
             finally:
-                await context.close()
+                await self._close_context(context)
 
     def poll_equip_data(
         self,
@@ -623,6 +555,8 @@ class CBGFetcher:
         max_cycles: int | None = None,
         initial_items: list[dict[str, Any]] | None = None,
         checkpoint: dict[str, Any] | None = None,
+        initial_delay_seconds: float = 0,
+        cycle_started_handler=None,
     ) -> dict[str, Any]:
         return _run_async(
             self.async_poll_equip_data(
@@ -640,6 +574,8 @@ class CBGFetcher:
                 max_cycles=max_cycles,
                 initial_items=initial_items,
                 checkpoint=checkpoint,
+                initial_delay_seconds=initial_delay_seconds,
+                cycle_started_handler=cycle_started_handler,
             )
         )
 
@@ -659,16 +595,9 @@ class CBGFetcher:
         max_cycles: int | None = None,
         initial_items: list[dict[str, Any]] | None = None,
         checkpoint: dict[str, Any] | None = None,
+        initial_delay_seconds: float = 0,
+        cycle_started_handler=None,
     ) -> dict[str, Any]:
-        if not PLAYWRIGHT_AVAILABLE:
-            result = self._failure_result(
-                url, "Playwright 未安装，无法启动轮询服务。", "browser_unavailable"
-            )
-            handled = result_handler(result, 1)
-            if inspect.isawaitable(handled):
-                await handled
-            return result
-
         interval_seconds = max(30, int(interval_seconds))
         max_pages = max(1, int(max_pages))
         incremental_pages = max(1, int(incremental_pages))
@@ -694,6 +623,17 @@ class CBGFetcher:
         if state and not bool(state.get("last_full_scan_complete")):
             full_due_in = 0.0
 
+        try:
+            initial_delay_seconds = max(0.0, float(initial_delay_seconds))
+        except (TypeError, ValueError):
+            initial_delay_seconds = 0.0
+
+        async def begin_cycle(cycle_number: int, scan_mode: str, started_at: str):
+            if cycle_started_handler is None:
+                return None
+            token = cycle_started_handler(cycle_number, scan_mode, started_at)
+            return await token if inspect.isawaitable(token) else token
+
         stop_states = {
             "access_denied",
             "browser_unavailable",
@@ -704,19 +644,63 @@ class CBGFetcher:
         }
         consecutive_failures = 0
         executed = 0
-        next_poll_at = time.monotonic()
         next_full_at = time.monotonic() + full_due_in
         last_result = self._failure_result(url, "尚未执行抓取", "not_started")
+
+        if initial_delay_seconds:
+            print(
+                f">> [重启保护] 等待 {initial_delay_seconds:.0f} 秒后再访问目标页面。",
+                flush=True,
+            )
+            await asyncio.sleep(initial_delay_seconds)
+        next_poll_at = time.monotonic()
+
+        if not PLAYWRIGHT_AVAILABLE:
+            started_at = datetime.now(timezone.utc).isoformat()
+            cycle += 1
+            scan_mode = "full" if time.monotonic() >= next_full_at else "incremental"
+            result = self._failure_result(
+                url, "Playwright 未安装，无法启动轮询服务。", "browser_unavailable"
+            )
+            result.update(
+                {
+                    "cycle": cycle,
+                    "started_at": started_at,
+                    "fetched_at": started_at,
+                    "scan_mode": scan_mode,
+                    "termination_reason": "browser_unavailable",
+                }
+            )
+            run_id = await begin_cycle(cycle, scan_mode, started_at)
+            if run_id is not None:
+                result["_run_id"] = run_id
+            handled = result_handler(result, cycle)
+            if inspect.isawaitable(handled):
+                await handled
+            return result
 
         async with async_playwright() as playwright:
             os.makedirs(self.user_data_dir, exist_ok=True)
             try:
-                context = await playwright.chromium.launch_persistent_context(
-                    **self._persistent_context_options(headless)
-                )
+                context = await self._launch_persistent_context(playwright, headless)
             except Exception as exc:
+                started_at = datetime.now(timezone.utc).isoformat()
+                cycle += 1
+                scan_mode = "full" if time.monotonic() >= next_full_at else "incremental"
                 result = self._failure_result(url, f"浏览器启动失败: {exc}", "browser_unavailable")
-                handled = result_handler(result, cycle + 1)
+                result.update(
+                    {
+                        "cycle": cycle,
+                        "started_at": started_at,
+                        "fetched_at": datetime.now(timezone.utc).isoformat(),
+                        "scan_mode": scan_mode,
+                        "termination_reason": "browser_start_failed",
+                    }
+                )
+                run_id = await begin_cycle(cycle, scan_mode, started_at)
+                if run_id is not None:
+                    result["_run_id"] = run_id
+                handled = result_handler(result, cycle)
                 if inspect.isawaitable(handled):
                     await handled
                 return result
@@ -734,16 +718,25 @@ class CBGFetcher:
                         f">> [轮询] 第 {cycle} 轮：{'深度扫描' if is_full_refresh else '增量扫描'}",
                         flush=True,
                     )
-                    fetched = await self._async_fetch_in_context(
-                        context,
-                        url,
-                        username,
-                        password,
-                        scan_rounds,
-                        scroll_delay,
-                        idle_rounds,
-                        snapshot_items,
-                    )
+                    run_id = await begin_cycle(cycle, scan_mode, started_at)
+                    try:
+                        fetched = await self._async_fetch_in_context(
+                            context,
+                            url,
+                            username,
+                            password,
+                            scan_rounds,
+                            scroll_delay,
+                            idle_rounds,
+                            snapshot_items,
+                        )
+                    except Exception as exc:
+                        fetched = self._failure_result(
+                            url,
+                            f"采集器执行异常: {exc}",
+                            "collector_error",
+                        )
+                        fetched["termination_reason"] = "collector_exception"
                     fetched_at = datetime.now(timezone.utc).isoformat()
                     last_result = dict(fetched)
                     last_result.update(
@@ -754,6 +747,8 @@ class CBGFetcher:
                             "scan_mode": scan_mode,
                         }
                     )
+                    if run_id is not None:
+                        last_result["_run_id"] = run_id
 
                     if last_result.get("success"):
                         observed = deduplicate_items(last_result.get("equip_list", []))
@@ -794,7 +789,7 @@ class CBGFetcher:
                     await asyncio.sleep(max(0.0, next_poll_at - now))
                 return last_result
             finally:
-                await context.close()
+                await self._close_context(context)
 
     async def _async_fetch_in_context(
         self,
@@ -1242,5 +1237,5 @@ def format_equip_list(equip_data: dict[str, Any]) -> str:
         )
     remaining = len(equip_data.get("equip_list", [])) - len(preview)
     if remaining > 0:
-        lines.append(f"  ……其余 {remaining} 项请查看预览页或导出文件")
+        lines.append(f"  ……其余 {remaining} 项请查看 SQLite 预览页")
     return "\n".join(lines)

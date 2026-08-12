@@ -70,6 +70,18 @@ function formatTime(value) {
   }).format(date);
 }
 
+function runStatus(run) {
+  if (run.run_status === "running") return "运行中";
+  if (run.run_status === "interrupted") return "已中断";
+  return run.success ? "成功" : "失败";
+}
+
+function runMode(run) {
+  if (run.scan_mode === "full") return "深度扫描";
+  if (run.scan_mode === "manual_verification") return "人工验证";
+  return "增量扫描";
+}
+
 function textCell(value, className = "") {
   const cell = document.createElement("td");
   if (className) cell.className = className;
@@ -138,7 +150,7 @@ function renderSummary(summary) {
   elements.fallback.textContent = `降级键 ${formatNumber(summary.fallback)}`;
   elements.changed.textContent = formatNumber(summary.changed_24h);
   const run = summary.last_run;
-  elements.runState.textContent = run ? (run.success ? "正常" : "失败") : "暂无";
+  elements.runState.textContent = run ? runStatus(run) : "暂无";
   elements.latestSeen.textContent = summary.latest_seen_at
     ? `观察于 ${formatTime(summary.latest_seen_at)}`
     : "等待首次采集";
@@ -157,17 +169,22 @@ function renderRuns(runs) {
     const row = document.createElement("article");
     row.className = "run-row";
     const time = document.createElement("strong");
-    time.textContent = formatTime(run.finished_at);
+    time.textContent = formatTime(run.run_status === "running" ? run.started_at : run.finished_at);
     const mode = document.createElement("span");
-    mode.textContent = run.scan_mode === "full" ? "深度扫描" : "增量扫描";
+    mode.textContent = runMode(run);
     const status = document.createElement("span");
-    status.className = `state-badge ${run.success ? "success" : "failure"}`;
-    status.textContent = run.success ? "成功" : "失败";
+    const statusClass = run.run_status === "running"
+      ? "running"
+      : (run.success ? "success" : "failure");
+    status.className = `state-badge ${statusClass}`;
+    status.textContent = runStatus(run);
     const summary = document.createElement("span");
     summary.className = "run-error";
-    summary.textContent = run.success
-      ? `观察 ${run.observed_count} · 新增 ${run.inserted_count} · 更新 ${run.updated_count}`
-      : (run.error || run.auth_state || "未知错误");
+    summary.textContent = run.run_status === "running"
+      ? `第 ${run.cycle} 轮正在采集`
+      : (run.success
+        ? `观察 ${run.observed_count} · 新增 ${run.inserted_count} · 更新 ${run.updated_count}`
+        : (run.error || run.auth_state || "未知错误"));
     const reason = document.createElement("span");
     reason.textContent = `${run.pages_scanned} 轮 · ${run.termination_reason || "—"}`;
     row.append(time, mode, status, summary, reason);

@@ -1,6 +1,6 @@
 import asyncio
-import csv
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -9,8 +9,6 @@ from cbg_fetcher import (
     CBGFetcher,
     _payload_indicates_end,
     _run_async,
-    export_to_csv,
-    export_to_json,
     extract_structured_items,
     format_equip_list,
     get_business_error,
@@ -20,9 +18,16 @@ from cbg_fetcher import (
     parse_cbg_url,
     summarize_api_payloads,
 )
-from data_model import normalize_equipment_item
 
 TARGET_URL = "https://yys.cbg.163.com/cgi/mweb/pl?view_loc=equip_list&tfid=f_kingkong"
+
+
+def test_relative_profile_path_is_not_based_on_process_cwd(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    fetcher = CBGFetcher(user_data_dir="browser_profiles/one")
+    assert Path(fetcher.user_data_dir) == (
+        Path(__file__).resolve().parents[1] / "browser_profiles" / "one"
+    )
 
 
 def test_url_parser_does_not_conflate_tracking_and_order_id():
@@ -129,38 +134,6 @@ def test_common_data_list_wrapper_is_parsed():
         [],
     )
     assert [item["id"] for item in items] == ["A"]
-
-
-def test_atomic_json_and_csv_exports_exclude_raw_captured_payload(tmp_path):
-    output = {
-        "success": True,
-        "captured_apis": [{"json": {"access_token": "secret"}}],
-        "equip_list": [
-            normalize_equipment_item(
-                {
-                    "equip_id": "A",
-                    "name": "项目",
-                    "price": 100,
-                    "access_token": "secret",
-                    "desc": "x" * 500,
-                },
-                source="api",
-            )
-        ],
-    }
-    json_path = tmp_path / "data.json"
-    csv_path = tmp_path / "data.csv"
-    export_to_json(output, str(json_path))
-    export_to_csv(output, str(csv_path))
-
-    json_payload = json.loads(json_path.read_text(encoding="utf-8"))
-    assert "captured_apis" not in json_payload
-    assert "secret" not in json.dumps(json_payload)
-    with csv_path.open(encoding="utf-8-sig", newline="") as handle:
-        rows = list(csv.DictReader(handle))
-    assert rows[0]["id"] == "A"
-    assert len(rows[0]["desc"]) > 300
-    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_sync_wrapper_rejects_nested_event_loop_cleanly():
@@ -272,6 +245,74 @@ def test_fetch_context_treats_confirmed_empty_list_as_success():
     assert result["equip_list"] == []
 
 
+def test_browser_launch_retries_transient_profile_failure(tmp_path):
+    fake_context = object()
+    fake_chromium = type("FakeChromium", (), {})()
+    fake_chromium.launch_persistent_context = AsyncMock(
+        side_effect=[RuntimeError("profile locked"), fake_context]
+    )
+    fake_playwright = type("FakePlaywright", (), {"chromium": fake_chromium})()
+    fetcher = CBGFetcher(
+        user_data_dir=str(tmp_path),
+        browser_start_attempts=3,
+        browser_retry_delay_seconds=2,
+    )
+
+    async def run():
+        with patch("cbg_fetcher.asyncio.sleep", new=AsyncMock()) as sleep:
+            context = await fetcher._launch_persistent_context(fake_playwright, False)
+            sleep.assert_awaited_once_with(2)
+            return context
+
+    assert asyncio.run(run()) is fake_context
+    assert fake_chromium.launch_persistent_context.await_count == 2
+
+
+def test_polling_waits_restart_delay_before_launching_browser(tmp_path):
+    events = []
+    fake_context = type("FakeContext", (), {"close": AsyncMock()})()
+    fake_chromium = type("FakeChromium", (), {})()
+
+    async def launch(**_options):
+        events.append("launch")
+        return fake_context
+
+    fake_chromium.launch_persistent_context = AsyncMock(side_effect=launch)
+    fake_playwright = type("FakePlaywright", (), {"chromium": fake_chromium})()
+
+    class Manager:
+        async def __aenter__(self):
+            return fake_playwright
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    fetcher = CBGFetcher(user_data_dir=str(tmp_path))
+    fetcher._async_fetch_in_context = AsyncMock(
+        return_value={"success": True, "auth_state": "authenticated", "equip_list": []}
+    )
+
+    async def sleep(delay):
+        events.append(("sleep", delay))
+
+    async def run():
+        with (
+            patch("cbg_fetcher.async_playwright", return_value=Manager()),
+            patch("cbg_fetcher.asyncio.sleep", side_effect=sleep),
+        ):
+            return await fetcher.async_poll_equip_data(
+                url=TARGET_URL,
+                username="user",
+                password="password",
+                result_handler=lambda _result, _cycle: None,
+                max_cycles=1,
+                initial_delay_seconds=45,
+            )
+
+    assert asyncio.run(run())["success"] is True
+    assert events[:2] == [("sleep", 45.0), "launch"]
+
+
 def test_polling_reuses_context_and_restores_cycle_checkpoint(tmp_path):
     fake_context = type("FakeContext", (), {"close": AsyncMock()})()
     fake_chromium = type("FakeChromium", (), {})()
@@ -293,6 +334,11 @@ def test_polling_reuses_context_and_restores_cycle_checkpoint(tmp_path):
         ]
     )
     handled = []
+    started = []
+
+    async def cycle_started(cycle, mode, started_at):
+        started.append((cycle, mode, bool(started_at)))
+        return cycle * 10
 
     async def run():
         with (
@@ -303,7 +349,9 @@ def test_polling_reuses_context_and_restores_cycle_checkpoint(tmp_path):
                 url=TARGET_URL,
                 username="user",
                 password="password",
-                result_handler=lambda result, cycle: handled.append((cycle, result["scan_mode"])),
+                result_handler=lambda result, cycle: handled.append(
+                    (cycle, result["scan_mode"], result["_run_id"])
+                ),
                 interval_seconds=60,
                 full_refresh_interval_seconds=3600,
                 max_cycles=2,
@@ -312,11 +360,13 @@ def test_polling_reuses_context_and_restores_cycle_checkpoint(tmp_path):
                     "last_full_scan_at": "2999-01-01T00:00:00+00:00",
                     "last_full_scan_complete": 1,
                 },
+                cycle_started_handler=cycle_started,
             )
 
     result = asyncio.run(run())
     assert result["success"] is True
-    assert handled == [(8, "incremental"), (9, "incremental")]
+    assert handled == [(8, "incremental", 80), (9, "incremental", 90)]
+    assert started == [(8, "incremental", True), (9, "incremental", True)]
     assert fake_chromium.launch_persistent_context.await_count == 1
     assert fetcher._async_fetch_in_context.await_count == 2
     fake_context.close.assert_awaited_once()

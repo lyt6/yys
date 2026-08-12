@@ -5,13 +5,14 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import sqlite3
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from storage import SQLiteStore
+from storage import SQLiteStore, resolve_project_path
 
 STATIC_FILES = {
     "/": "index.html",
@@ -151,18 +152,19 @@ def main() -> int:
         help="明确允许监听非本机地址（服务本身没有身份认证）",
     )
     args = parser.parse_args()
+    database_path = resolve_project_path(args.database)
     try:
         server = build_server(
-            args.database,
+            database_path,
             args.host,
             args.port,
             allow_remote=args.allow_remote,
         )
-    except ValueError as exc:
+    except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
         parser.error(str(exc))
     host, port = server.server_address[:2]
     print(f"预览页已启动：http://{host}:{port}", flush=True)
-    print(f"数据库：{Path(args.database).resolve()}", flush=True)
+    print(f"数据库：{database_path}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

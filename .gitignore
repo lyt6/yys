@@ -2,7 +2,7 @@
 browser_profile*/
 cookies.json
 
-# Generated databases, exports, logs and local locks
+# Generated databases, logs, local locks and legacy local exports
 data/
 equip_data.json
 equip_data.csv
